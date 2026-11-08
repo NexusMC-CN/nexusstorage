@@ -17,10 +17,20 @@ export class MemoryCache {
     return request.url.split('#', 1)[0]!;
   }
 
-  async match(input: RequestInfo | URL): Promise<Response | undefined> {
+  #matches(entry: { request: Request; response: Response }, filter: Request, options: CacheQueryOptions): boolean {
+    if (filter.method !== 'GET' && !options.ignoreMethod) return false;
+    if (this.#matchURL(entry.request, options.ignoreSearch) !== this.#matchURL(filter, options.ignoreSearch)) return false;
+    const vary = entry.response.headers.get('vary');
+    return !!options.ignoreVary || vary === null || vary.split(',').map(field => field.trim()).filter(Boolean)
+      .every(field => field !== '*' && entry.request.headers.get(field) === filter.headers.get(field));
+  }
+
+  async match(input: RequestInfo | URL, options: CacheQueryOptions = {}): Promise<Response | undefined> {
     const request = this.#request(input);
-    if (request.method !== 'GET') return undefined;
-    return this.#entries.get(this.#matchURL(request))?.response.clone();
+    for (const entry of this.#entries.values()) {
+      if (this.#matches(entry, request, options)) return entry.response.clone();
+    }
+    return undefined;
   }
 
   async put(input: RequestInfo | URL, response: Response): Promise<void> {
@@ -29,22 +39,20 @@ export class MemoryCache {
     this.#entries.set(this.#matchURL(request), { request: request.clone(), response: response.clone() });
   }
 
-  async delete(input: RequestInfo | URL): Promise<boolean> {
+  async delete(input: RequestInfo | URL, options: CacheQueryOptions = {}): Promise<boolean> {
     const request = this.#request(input);
-    return request.method === 'GET' && this.#entries.delete(this.#matchURL(request));
+    let removed = false;
+    for (const [url, entry] of this.#entries) {
+      if (this.#matches(entry, request, options)) removed = this.#entries.delete(url) || removed;
+    }
+    return removed;
   }
 
   async keys(input?: RequestInfo | URL, options: CacheQueryOptions = {}): Promise<Request[]> {
     const filter = input === undefined ? undefined : this.#request(input);
     if (filter && filter.method !== 'GET' && !options.ignoreMethod) return [];
     return [...this.#entries.values()]
-      .filter(({ request, response }) => {
-        if (!filter) return true;
-        if (this.#matchURL(request, options.ignoreSearch) !== this.#matchURL(filter, options.ignoreSearch)) return false;
-        const vary = response.headers.get('vary');
-        return options.ignoreVary || vary === null || vary.split(',').map(field => field.trim()).filter(Boolean)
-          .every(field => field !== '*' && request.headers.get(field) === filter.headers.get(field));
-      })
+      .filter(entry => !filter || this.#matches(entry, filter, options))
       .map(({ request }) => request.clone());
   }
 }

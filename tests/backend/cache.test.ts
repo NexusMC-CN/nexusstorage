@@ -91,6 +91,82 @@ test('the memory Cache helper applies Vary unless query options explicitly ignor
   assert.deepEqual((await cache.keys(new Request('https://nexusstorage.invalid/v1/%22a%22'), { ignoreVary: true })).map(request => request.url), [fragment]);
 });
 
+test('the memory Cache helper applies Vary to response reads and deletions', async () => {
+  const cache = await caches.open('varyMatching');
+  const url = 'https://nexusstorage.invalid/v1/%22a%22';
+  const saved = new Request(url, { headers: { 'X-Language': 'zh' } });
+  await cache.put(saved, new Response('zh-body', { headers: { Vary: 'X-Language' } }));
+  assert.equal(await cache.match(url), undefined);
+  assert.equal(await cache.delete(url), false);
+  assert.equal(await (await cache.match(saved))?.text(), 'zh-body');
+  assert.equal(await cache.delete(saved), true);
+  assert.equal(await cache.match(saved), undefined);
+});
+
+test('the memory Cache helper replaces same-URL entries on put as observed in Chromium', async () => {
+  const cache = await caches.open('varyReplacing');
+  const url = 'https://nexusstorage.invalid/v1/%22a%22';
+  const zh = new Request(url, { headers: { 'X-Language': 'zh' } });
+  const en = new Request(url, { headers: { 'X-Language': 'en' } });
+  await cache.put(zh, new Response('zh-body', { headers: { Vary: 'X-Language' } }));
+  await cache.put(en, new Response('en-body', { headers: { Vary: 'X-Language' } }));
+  assert.deepEqual((await cache.keys()).map(request => request.headers.get('X-Language')), ['en']);
+  assert.equal(await cache.match(zh), undefined);
+  assert.equal(await (await cache.match(en))?.text(), 'en-body');
+});
+
+for (const fixture of ['vary mismatch', 'vary match', 'duplicate snapshot'] as const) {
+  for (const operationName of ['get', 'has', 'set', 'update', 'remove', 'keys', 'backend keys', 'scan', 'clear'] as const) {
+    test(`${operationName} rejects a canonical ${fixture} and preserves every record`, async () => {
+      const namespace = `internal ${fixture} ${operationName}`;
+      const store = new NexusStorage({ driver: 'cacheStorage', namespace });
+      const backend = new CacheStorageBackend(namespace);
+      const cache = await caches.open(`nexusstorage:${JSON.stringify(namespace)}`);
+      try {
+        await store.set('safe', { safe: true });
+        const url = 'https://nexusstorage.invalid/v1/%22a%22';
+        const saved = new Request(url, fixture === 'vary mismatch' ? { headers: { 'X-Language': 'zh' } } : {});
+        const vary = fixture !== 'duplicate snapshot';
+        await cache.put(saved, new Response('{"variant":"original"}', vary ? { headers: { Vary: 'X-Language' } } : {}));
+        if (fixture === 'vary mismatch') {
+          assert.equal(await cache.match(url), undefined, 'The fixture must hide the variant from a headerless request.');
+          assert.deepEqual((await cache.keys(url, { ignoreVary: true })).map(request => request.url), [url]);
+        }
+        if (fixture === 'duplicate snapshot') {
+          const keys = cache.keys.bind(cache);
+          // A defensive imported/corrupt snapshot; Chromium put itself replaces same-URL entries.
+          cache.keys = async (...args) => {
+            const requests = await keys(...args);
+            return requests.some(request => request.url === url)
+              ? [...requests, new Request(url, { headers: { 'X-Variant': 'duplicate' } })]
+              : requests;
+          };
+        }
+        let transformed = false;
+        const operations = {
+          get: () => store.get('a'),
+          has: () => store.has('a'),
+          set: () => store.set('a', { replaced: true }),
+          update: () => backend.update('a', () => { transformed = true; return '{"replaced":true}'; }),
+          remove: () => store.remove('a'),
+          keys: () => store.keys(),
+          'backend keys': () => backend.keys(),
+          scan: () => backend.scan(() => {}),
+          clear: () => store.clear(),
+        };
+        await assert.rejects(operations[operationName](), errorCode('CORRUPT_DATA'));
+        assert.equal(transformed, false);
+        assert.deepEqual(await store.get('safe'), { safe: true });
+        assert.equal(await (await cache.match(saved))?.text(), '{"variant":"original"}');
+        assert.equal((await cache.keys(url, { ignoreVary: true })).length, fixture === 'duplicate snapshot' ? 2 : 1);
+      } finally {
+        await store.close();
+        await backend.close();
+      }
+    });
+  }
+}
+
 test('the memory Cache helper honors ignoreSearch and ignoreMethod query options', async () => {
   const cache = await caches.open('queryHelper');
   const url = 'https://example.test/item?stored=1#fragment';

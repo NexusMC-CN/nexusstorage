@@ -3,6 +3,7 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { NexusStorage } from '../../src/index.js';
 import { CacheStorageBackend } from '../../src/backend/cache.js';
 import type { StorageBackend } from '../../src/backend/index.js';
+import { NexusStorageError } from '../../src/errors.js';
 import { MemoryCacheStorage } from '../helpers/memory/cache.js';
 import type { MemoryCache } from '../helpers/memory/cache.js';
 
@@ -70,13 +71,92 @@ test('Cache scan reads owned values after one ownership analysis and sees peer w
   await populate(cache, backend);
   const counts = countEnumeration(cache);
   const scan = (backend as StorageBackend).scan;
-  assert.ok(scan, 'Cache must expose bulk reading for public keys.');
-  const entries = await scan.call(backend);
+  assert.ok(scan, 'Cache must expose sequential reading for public keys.');
+  const entries: Array<{ key: string; value: string }> = [];
+  assert.equal(await scan.call(backend, entry => { entries.push(entry); }), undefined);
   assert.equal(entries.length, 12);
   assert.deepEqual(entries.find(entry => entry.key === 'key11'), { key: 'key11', value: '11' });
   assert.deepEqual(counts, { full: 1, filtered: 0, returned: 20, visited: 20 });
   await new CacheStorageBackend('scan').set('peer', '42');
-  assert.ok((await scan.call(backend)).some(entry => entry.key === 'peer' && entry.value === '42'));
+  entries.length = 0;
+  await scan.call(backend, entry => { entries.push(entry); });
+  assert.ok(entries.some(entry => entry.key === 'peer' && entry.value === '42'));
+});
+
+test('Cache scan visits each body before reading the next body', async () => {
+  const backend = new CacheStorageBackend('scan');
+  const cache = await caches.open('nexusstorage:"scan"');
+  await backend.set('first', '1');
+  await backend.set('second', '2');
+  const events: string[] = [];
+  const match = cache.match.bind(cache);
+  cache.match = async (...args) => {
+    const response = await match(...args);
+    if (response) {
+      const text = response.text.bind(response);
+      response.text = async () => {
+        const body = await text();
+        events.push(`body:${body}`);
+        return body;
+      };
+    }
+    return response;
+  };
+  await backend.scan(entry => { events.push(`visit:${entry.key}:${entry.value}`); });
+  assert.deepEqual(events, ['body:1', 'visit:first:1', 'body:2', 'visit:second:2']);
+});
+
+test('Cache scan preserves a visitor library error and stops before reading any later body', async () => {
+  const backend = new CacheStorageBackend('scan');
+  const cache = await caches.open('nexusstorage:"scan"');
+  await backend.set('first', '1');
+  await backend.set('second', '2'.repeat(128 * 1024));
+  const bodies: string[] = [];
+  const match = cache.match.bind(cache);
+  cache.match = async (...args) => {
+    const response = await match(...args);
+    if (response) {
+      const text = response.text.bind(response);
+      response.text = async () => {
+        bodies.push(args[0] instanceof Request ? args[0].url : String(args[0]));
+        return text();
+      };
+    }
+    return response;
+  };
+  const cause = new NexusStorageError('CORRUPT_DATA', 'Invalid record.');
+  const visited: string[] = [];
+  await assert.rejects(backend.scan(entry => { visited.push(entry.key); throw cause; }), error => error === cause);
+  assert.deepEqual(visited, ['first']);
+  assert.deepEqual(bodies, ['https://nexusstorage.invalid/v1/%22first%22']);
+});
+
+test('Cache scan wraps body failures and does not visit or read subsequent records', async () => {
+  const backend = new CacheStorageBackend('scan');
+  const cache = await caches.open('nexusstorage:"scan"');
+  await backend.set('first', '1');
+  await backend.set('broken', '2');
+  await backend.set('later', '3');
+  const match = cache.match.bind(cache);
+  const bodies: string[] = [];
+  const cause = new Error('Body stream failed.');
+  cache.match = async (...args) => {
+    const response = await match(...args);
+    if (response) {
+      const text = response.text.bind(response);
+      response.text = async () => {
+        const body = await text();
+        bodies.push(body);
+        if (body === '2') throw cause;
+        return body;
+      };
+    }
+    return response;
+  };
+  const visited: string[] = [];
+  await assert.rejects(backend.scan(entry => { visited.push(entry.key); }), { code: 'STORAGE_ERROR', cause });
+  assert.deepEqual(visited, ['first']);
+  assert.deepEqual(bodies, ['1', '2']);
 });
 
 test('Cache clear enumerates and traverses all requests once while preserving foreign resources', async () => {
@@ -117,8 +197,8 @@ test('Cache scan rejects listed canonical/fragment conflicts before reading any 
   const match = cache.match.bind(cache);
   cache.match = async input => { matches++; return match(input); };
   const scan = (backend as StorageBackend).scan;
-  assert.ok(scan, 'Cache must expose bulk reading for public keys.');
-  await assert.rejects(scan.call(backend), { code: 'CORRUPT_DATA' });
+  assert.ok(scan, 'Cache must expose sequential reading for public keys.');
+  await assert.rejects(scan.call(backend, () => { assert.fail('A conflicted snapshot must not visit records.'); }), { code: 'CORRUPT_DATA' });
   assert.equal(matches, 0);
   assert.equal(await (await match(fragment))?.text(), 'external');
 });

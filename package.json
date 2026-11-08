@@ -54,6 +54,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
     "fake-indexeddb": "^6.2.7",
     "playwright": "^1.65.0",
     "tsup": "^9.0.0",

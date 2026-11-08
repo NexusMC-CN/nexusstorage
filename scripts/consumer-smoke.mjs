@@ -581,6 +581,34 @@ const transformedTransaction: Promise<number | undefined> = transformed.transact
   return read;
 });
 void transformedWrite; void transformedRead; void transformedEntry; void transformedSwap; void transformedTransaction;
+type ObjectInput = { n: string };
+type ObjectOutput = { n: number };
+const objectInputSchema = {} as StandardSchemaV1<ObjectInput, ObjectOutput>;
+const objectStoredSchema = {} as StandardSchemaV1<ObjectOutput>;
+const objectTransformed = new NexusStorage({ driver: 'memory',
+  schemas: { counter: objectInputSchema }, storedSchemas: { counter: objectStoredSchema } });
+const objectWrite: Promise<ObjectOutput> = objectTransformed.set('counter', { n: '42' });
+const objectRead: Promise<ObjectOutput | undefined> = objectTransformed.get('counter');
+const objectPatch: Promise<ObjectOutput> = objectTransformed.update('counter', { n: 43 });
+const objectSwap: Promise<StorageEntry<ObjectOutput>> = objectTransformed.compareAndSwap('counter', null, { n: '44' });
+const objectTransaction: Promise<ObjectOutput> = objectTransformed.transaction(['counter'], tx => {
+  const written: ObjectOutput = tx.set('counter', { n: '45' });
+  const patched: ObjectOutput = tx.update('counter', { n: 46 });
+  const read: ObjectOutput | undefined = tx.get('counter');
+  // @ts-expect-error Transaction set accepts the original string field, not the stored number.
+  tx.set('counter', { n: 47 });
+  // @ts-expect-error Transaction update patches the numeric output object, not the input object.
+  tx.update('counter', { n: '48' });
+  void written; void read;
+  return patched;
+});
+// @ts-expect-error Object set accepts Input, even when an Output stored validator is configured.
+void objectTransformed.set('counter', { n: 42 });
+// @ts-expect-error Object update accepts Partial<Output>, so input-shaped patches are rejected.
+void objectTransformed.update('counter', { n: '43' });
+// @ts-expect-error CAS also accepts the object input shape.
+void objectTransformed.compareAndSwap('counter', null, { n: 44 });
+void objectWrite; void objectRead; void objectPatch; void objectSwap; void objectTransaction;
 // @ts-expect-error Input types remain string after adding a number storage validator.
 void transformed.set('length', 5);
 // @ts-expect-error A stored schema can only use an already declared input-schema key.

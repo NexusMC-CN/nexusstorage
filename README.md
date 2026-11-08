@@ -123,9 +123,9 @@ Cache Storage 在安全上下文中可直接从页面或 Worker 使用，不强�
 
 `clear()` 仅移除该命名空间内由本包管理的 JSON 记录，保留其他 Cache Storage 缓存与非本包记录。应用清理自己的资源缓存时，也应只删除自己明确管理的缓存名。
 
-Cache API 的原生 URL 匹配会忽略 `#` 片段。如果同一命名缓存中存在与内部记录 URL 冲突的非规范外部条目，相关读写以 `CORRUPT_DATA` 拒绝，避免误读、覆盖或删除外部数据。
+Cache API 的原生 URL 匹配会忽略 `#` 片段。如果同一命名缓存中存在与内部记录 URL 冲突的非规范外部条目，相关读写以 `CORRUPT_DATA` 拒绝，避免误读、覆盖或删除外部数据。每个内部规范 URL 只允许一条记录，且响应的 `Vary` 必须缺失或为空；即使只有一个变体，非空 `Vary` 也不符合本包的键值记录约束。检测到内部重复 URL 或非空 `Vary` 时，`get / has / set / update / remove / keys / clear` 均拒绝，不任意选择一个变体。`clear` 在删除前检查整份请求快照的归属、冲突和响应头，遇到这些问题时保留原记录；不属于本包的独立外部资源仍予保留。
 
-`keys()` 集中读取记录并过滤过期项，`clear()` 一次枚举后分析归属与冲突，避免逐 key 重复全库枚举；结果不长期缓存，因此后续调用仍能看到其他实例的新写入。单 key 操作可使用带请求条件的 Cache 查询，但不保证浏览器内部查询的复杂度。普通 JSON 响应使用 `application/json; charset=utf-8`；带 `NexusStorage/` 前缀的有效期或版本记录使用 `application/x.nexusstorage-record; charset=utf-8`，应通过本包解码。
+`keys()` 一次枚举请求，逐条读取、解码正文并过滤过期项，不先收集所有原始正文字符串；前一条记录损坏时立即拒绝，不再读取后续正文。`clear()` 同样只枚举一次请求后分析归属与冲突，避免逐 key 重复全库枚举；请求快照本身仍占用空间，这些行为不构成固定内存用量保证。结果不长期缓存，因此后续调用仍能看到其他实例的新写入。单 key 操作可使用带请求条件的 Cache 查询，但不保证浏览器内部查询的复杂度。普通 JSON 响应使用 `application/json; charset=utf-8`；带 `NexusStorage/` 前缀的有效期或版本记录使用 `application/x.nexusstorage-record; charset=utf-8`，应通过本包解码。
 
 ## 配置与方法
 
@@ -272,6 +272,8 @@ try {
 
 广播消息不持久化，也不提供锁或事务保证；外部直接调用浏览器原生存储 API 不会自动产生本包事件。
 
+localStorage 的内部 `events:1` 通知协议兼容旧 `id` 信封：新版发送 `instanceId`、`eventId`，同时保留 `id: eventId`，接收方也接受仅含旧 `id` 的合法消息。这样，仍在运行的旧页面与新页面可双向接收通知。维护此协议时，同一版本须保留旧接收方依赖的字段和旧消息读取能力；不兼容的改动应使用新的协议版本与明确的过渡安排。内部标识只用于传输与去重，不进入公开事件对象。
+
 ## 按 key 配置 Schema
 
 传入符合 Standard Schema V1 结构的同步校验器即可启用运行时校验，无需额外运行时依赖。`schemas` 负责写入输入的转换，`storedSchemas` 负责检查转换后的存储形态。例如，字符串转长度后，读取只需检查数字：
@@ -321,6 +323,55 @@ try {
 ```
 
 配置 `schemas` 的 TypeScript 实例将 key 限定为已声明项。`set`、CAS 与 `tx.set` 接受对应输入类型，只执行一次输入转换；读取及写入结果按 key 推导输出类型，`getEntry` 与 CAS 用 `StorageEntry` 包装输出。`storedSchemas` 只允许已有 schema 的 key，校验器的输入 / 输出绑定该 key 的输出类型；它不会改变公开方法的类型推导。对象更新、TTL 与 Schema 组合示例见 [`examples/features/managed.ts`](examples/features/managed.ts)。公开类型还包括 `StorageSchemas`、`StoredSchemas`、`InferSchemaInput`、`InferSchemaOutput`、`WriteOptions`、`StorageCapabilities`、`StorageTransaction` 和 `StorageEvent`。
+
+下面用 `Input` 表示对应 key 的输入 schema 输入类型，用 `Output` 表示其输出及实际存储类型：
+
+| 方法 | 接受的业务值 | 返回的业务值 | 使用的校验 |
+| --- | --- | --- | --- |
+| `set` / `tx.set` | `Input` | `Output` | 输入转换一次，再校验存储值 |
+| `compareAndSwap` | `Input` | `StorageEntry<Output>` | 输入转换一次，再校验存储值 |
+| `get` / `tx.get` | 无 | `Output \| undefined` | 只校验已有存储值 |
+| `getEntry` | 无 | `StorageEntry<Output> \| undefined` | 只校验已有存储值 |
+| `update` / `tx.update` | `Partial<Output>`，仅普通对象 | 完整的 `Output` 对象 | 浅合并后校验完整存储值 |
+
+`tx` 方法同步返回表中的结果，其余方法用 Promise 包装。`has / remove / keys / clear` 不接受业务值，分别返回布尔值、布尔值、key 数组和 `void`；`keys` 只检查记录格式与有效期。
+
+例如，输入对象 `{ n: string }` 转为存储对象 `{ n: number }` 后，后续 patch 要使用数字：
+
+```ts
+type Input = { n: string };
+type Output = { n: number };
+
+const counterInput: StandardSchemaV1<Input, Output> = {
+  '~standard': { version: 1, vendor: 'my-app', validate(value) {
+    if (value && typeof value === 'object' && 'n' in value
+      && typeof value.n === 'string' && value.n.trim() !== '' && Number.isFinite(Number(value.n))) {
+      return { value: { n: Number(value.n) } };
+    }
+    return { issues: [{ message: 'n 必须是数字字符串' }] };
+  } },
+};
+const counterStored: StandardSchemaV1<Output> = {
+  '~standard': { version: 1, vendor: 'my-app', validate(value) {
+    return value && typeof value === 'object' && 'n' in value
+      && typeof value.n === 'number' && Number.isFinite(value.n)
+      ? { value: { n: value.n } }
+      : { issues: [{ message: '存储的 n 必须是有限数字' }] };
+  } },
+};
+const counters = new NexusStorage({ driver: 'memory',
+  schemas: { counter: counterInput }, storedSchemas: { counter: counterStored } });
+try {
+  await counters.set('counter', { n: '42' }); // Output: { n: 42 }
+  await counters.update('counter', { n: 43 }); // Output: { n: 43 }，不再转换输入
+  // counters.set('counter', { n: 42 });     // 类型错误：set 接受 Input
+  // counters.update('counter', { n: '43' }); // 类型错误：patch 接受 Partial<Output>
+} finally {
+  await counters.close();
+}
+```
+
+对象 patch 按顶层浅合并：未出现的顶层字段保留，出现的嵌套对象整体替换，不进行递归合并。
 
 输入在校验前捕获严格 JSON 快照，转换结果再次检查并复制，输入和输出均须符合下述 JSON 规则。写入前还会验证转换结果能作为存储值；`get`、`getEntry`、`tx.get` 同样验证已有数据，包括历史记录。存储校验必须保持 JSON 值不变，可以返回独立副本，比较时忽略对象属性顺序；改变值的转换会被拒绝，绝不采用二次转换结果。读取校验失败不重写记录。
 
@@ -458,6 +509,8 @@ npm run test:browser
 2026-11-08 第一阶段历史验证：同一 Chromium 版本通过 210 项浏览器检查，保留上述覆盖，并验证五种驱动的 TTL 临界判断、更新保留 / 重设期限、同步 Schema 校验失败保留旧值、异步校验拒绝、Memory 实例与刷新隔离，以及带期限和 Schema 的跨标签页并发更新。真实 Service Worker 可读取带有效期的记录格式。该历史记录不包含第二阶段事务、CAS 与事件，测试结果仅对应当时环境。
 
 2026-11-08 第二阶段验证：Chromium `156.0.8078.4` 通过完整 312 项浏览器检查，其中保留上述 210 项，新增 102 项能力声明、事务、CAS、TTL 取消与事件检查。验证包括真实双标签页 IndexedDB CAS 竞争、80 次并发双 key 转账的总额守恒、Schema / 异步回调失败回滚与事件静默、事务上下文失效，以及三种共享驱动的跨标签页元数据通知和提交后重新读取。完整检查包含 200 次连续 localStorage 写入 / 清除后的立即读取；另行执行的 500 次顺序变更复现检查未发现陈旧读取。结果仅对应本次环境，不代表其他浏览器版本均已验证。
+
+2026-11-08 审查修复验证：`npm run check` 通过 575 项单元测试、构建、真实 tarball 安装运行与类型合同；同一 Chromium 版本通过完整 494 项浏览器检查，保留此前 437 项并增加 57 项。新增检查覆盖冻结的 `21c6335` 旧事件类与新版双向通知、内部 Vary 记录拒绝及保留、逐条正文解码和损坏记录早停。旧事件夹具仅适配当前辅助模块导入，不是完整旧包兼容性测试。本次 Chromium 两次同 URL Vary 写入仅保留最后一条；重复请求快照另以单元测试检查。逐条处理的验证不代表测量了实际内存峰值或垃圾回收行为。
 
 Migration、通用批量操作与诊断工具保留在后续路线图，当前未实现。当前也不包含加密、查询、响应式绑定、持久队列、文件扩展或后端自动切换。
 

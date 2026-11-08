@@ -3,13 +3,18 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { chromium } from 'playwright';
 import { runSecondStageBrowserChecks } from './browser-second-stage.mjs';
+import { legacyEventBundle, runFollowupBrowserChecks } from './browser/followup.mjs';
 
 // A fresh browser context and a random loopback origin isolate all test data.
 const bundle = await readFile(new URL('../dist/index.js', import.meta.url));
+const legacyEvents = await legacyEventBundle();
 const server = createServer((request, response) => {
   if (request.url === '/index.js') {
     response.writeHead(200, { 'content-type': 'text/javascript' });
     response.end(bundle);
+  } else if (request.url === '/legacy-events.js') {
+    response.writeHead(200, { 'content-type': 'text/javascript' });
+    response.end(legacyEvents);
   } else if (request.url === '/storage-worker.js') {
     response.writeHead(200, { 'content-type': 'text/javascript' });
     response.end(`
@@ -423,8 +428,11 @@ try {
   const existingChecks = results.length;
   assert.equal(existingChecks, 312, 'All previous stages must remain enabled');
   await (await import('./browser-review.mjs')).runReviewBrowserChecks({ page, secondPage, results });
+  const reviewChecks = results.length;
+  assert.equal(reviewChecks, 437, 'All 437 previous browser checks must remain enabled');
+  await runFollowupBrowserChecks({ page, secondPage, results });
   assert.deepEqual(errors, []);
-  console.log(`Chromium ${browser.version()}: ${results.length} browser checks passed (${existingChecks} existing, ${results.length - existingChecks} review regressions).`);
+  console.log(`Chromium ${browser.version()}: ${results.length} browser checks passed (${reviewChecks} existing, ${results.length - reviewChecks} followup regressions).`);
 } finally {
   if (browser) await browser.close();
   await new Promise(resolve => server.close(resolve));

@@ -3,6 +3,7 @@ import { getEventListeners } from 'node:events';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { StorageEvents, type StorageEvent } from '../src/events.js';
 import type { StorageDriver } from '../src/types.js';
+import { StorageEvents as LegacyStorageEvents } from './fixtures/events/legacy.js';
 
 class TestWindow extends EventTarget {
   readonly localStorage: TestLocalStorage;
@@ -92,7 +93,7 @@ describe('storage events', () => {
   const original = Object.getOwnPropertyDescriptor(globalThis, 'BroadcastChannel');
   const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
   const originalStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
-  const dispatchers: StorageEvents[] = [];
+  const dispatchers: Array<StorageEvents | LegacyStorageEvents> = [];
   let storageNetwork: TestStorageNetwork;
   let primaryWindow: TestWindow;
 
@@ -471,11 +472,74 @@ describe('storage events', () => {
     for (const wire of wires) {
       assert.equal(wire.key, 'nexusstorage:events:1:["localStorage","native"]');
       assert.equal(wire.key.startsWith('nexusstorage:"native":'), false);
-      assert.deepEqual(Object.keys(wire.value).sort(), ['driver', 'eventId', 'instanceId', 'key', 'namespace', 'operation', 'source', 'type']);
+      assert.deepEqual(Object.keys(wire.value).sort(), ['driver', 'eventId', 'id', 'instanceId', 'key', 'namespace', 'operation', 'source', 'type']);
+      assert.equal(wire.value.id, wire.value.eventId);
       assert.equal(JSON.stringify(wire.value).includes('private'), false);
     }
     assert.equal(TestBroadcastChannel.channels.size, 0);
   });
+
+  for (const [leftVersion, Left] of [['legacy', LegacyStorageEvents], ['current', StorageEvents]] as const) {
+    for (const [rightVersion, Right] of [['legacy', LegacyStorageEvents], ['current', StorageEvents]] as const) {
+      it(`exchanges id-compatible change, remove and clear events between ${leftVersion} and ${rightVersion} windows`, async () => {
+        const namespace = `mixed-${leftVersion}-${rightVersion}`;
+        const controlKey = `nexusstorage:events:1:${JSON.stringify(['localStorage', namespace])}`;
+        const left = new Left('localStorage', namespace, true);
+        const leftSeen: StorageEvent[] = [];
+        for (const type of ['change', 'remove', 'clear'] as const) left.on(type, event => { leftSeen.push(event); });
+        const rightWindow = storageNetwork.createWindow();
+        useWindow(rightWindow);
+        const right = new Right('localStorage', namespace, true);
+        dispatchers.push(left, right);
+        const rightSeen: StorageEvent[] = [];
+        for (const type of ['change', 'remove', 'clear'] as const) right.on(type, event => { rightSeen.push(event); });
+
+        const leftWires: Array<Record<string, unknown>> = [];
+        const rightWires: Array<Record<string, unknown>> = [];
+        const capture = (values: Array<Record<string, unknown>>) => (event: Event) => {
+          const storage = event as globalThis.StorageEvent;
+          if (storage.key === controlKey && storage.newValue !== null) values.push(JSON.parse(storage.newValue));
+        };
+        rightWindow.addEventListener('storage', capture(leftWires));
+        primaryWindow.addEventListener('storage', capture(rightWires));
+        const changes = [
+          { type: 'change', operation: 'set', key: 'item' },
+          { type: 'remove', operation: 'remove', key: 'item' },
+          { type: 'clear', operation: 'clear' },
+        ] as const;
+        for (const change of changes) left.publish(change);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(leftSeen, [
+          { type: 'change', operation: 'set', key: 'item', driver: 'localStorage', namespace, source: 'local' },
+          { type: 'remove', operation: 'remove', key: 'item', driver: 'localStorage', namespace, source: 'local' },
+          { type: 'clear', operation: 'clear', driver: 'localStorage', namespace, source: 'local' },
+        ]);
+        assert.deepEqual(rightSeen, [
+          { type: 'change', operation: 'set', key: 'item', driver: 'localStorage', namespace, source: 'remote' },
+          { type: 'remove', operation: 'remove', key: 'item', driver: 'localStorage', namespace, source: 'remote' },
+          { type: 'clear', operation: 'clear', driver: 'localStorage', namespace, source: 'remote' },
+        ]);
+        leftSeen.length = 0;
+        rightSeen.length = 0;
+        for (const change of changes) right.publish(change);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(leftSeen.map(event => [event.type, event.source]), [['change', 'remote'], ['remove', 'remote'], ['clear', 'remote']]);
+        assert.deepEqual(rightSeen.map(event => [event.type, event.source]), [['change', 'local'], ['remove', 'local'], ['clear', 'local']]);
+        for (const [version, wires] of [[leftVersion, leftWires], [rightVersion, rightWires]] as const) {
+          assert.equal(wires.length, 3, 'remote reception must not rebroadcast');
+          for (const wire of wires) {
+            assert.equal(typeof wire.id, 'string');
+            assert.notEqual(wire.id, '');
+            if (version === 'legacy') {
+              assert.equal(Object.hasOwn(wire, 'instanceId'), false);
+              assert.equal(Object.hasOwn(wire, 'eventId'), false);
+            } else assert.equal(wire.id, wire.eventId);
+          }
+        }
+        assert.equal(storageNetwork.entries.size, 0);
+      });
+    }
+  }
 
   it('broadcasts within the same window and across windows in the exact namespace', async () => {
     const sender = create('localStorage', 'native:"scope"', true);
@@ -553,16 +617,87 @@ describe('storage events', () => {
     assert.equal(wires.length, 1);
   });
 
-  it('deduplicates repeated native messages by both instance and event identity', () => {
+  it('deduplicates repeated dual-format messages by both instance and event identity', () => {
     const events = create('localStorage', 'native-repeated', true);
     const seen: StorageEvent[] = [];
     events.on('remove', event => { seen.push(event); });
     const controlKey = 'nexusstorage:events:1:["localStorage","native-repeated"]';
-    const message = { instanceId: 'first-instance', eventId: 'same-event', type: 'remove', operation: 'remove', key: 'item', driver: 'localStorage', namespace: 'native-repeated', source: 'local' };
+    const message = { id: 'same-event', instanceId: 'first-instance', eventId: 'same-event', type: 'remove', operation: 'remove', key: 'item', driver: 'localStorage', namespace: 'native-repeated', source: 'local' };
     dispatchNative(primaryWindow, controlKey, JSON.stringify(message));
     dispatchNative(primaryWindow, controlKey, JSON.stringify(message));
     dispatchNative(primaryWindow, controlKey, JSON.stringify({ ...message, instanceId: 'second-instance' }));
     assert.deepEqual(seen.map(event => event.key), ['item', 'item']);
+  });
+
+  it('deduplicates id-only legacy notifications per window and freezes metadata for same-window peers', () => {
+    const events = create('localStorage', 'native-legacy', true);
+    const peer = create('localStorage', 'native-legacy', true);
+    const seen: StorageEvent[][] = [[], [], []];
+    for (const type of ['change', 'remove', 'clear'] as const) {
+      events.on(type, event => { seen[0]!.push(event); });
+      peer.on(type, event => { seen[1]!.push(event); });
+    }
+    const otherWindow = storageNetwork.createWindow();
+    useWindow(otherWindow);
+    const other = create('localStorage', 'native-legacy', true);
+    for (const type of ['change', 'remove', 'clear'] as const) other.on(type, event => { seen[2]!.push(event); });
+    const controlKey = 'nexusstorage:events:1:["localStorage","native-legacy"]';
+    for (const message of [
+      { id: 'legacy-change', type: 'change', operation: 'update', key: 'item' },
+      { id: 'legacy-remove', type: 'remove', operation: 'remove', key: 'item' },
+      { id: 'legacy-clear', type: 'clear', operation: 'clear' },
+    ]) {
+      const wire = JSON.stringify({ ...message, driver: 'localStorage', namespace: 'native-legacy', source: 'local', value: 'secret' });
+      dispatchNative(primaryWindow, controlKey, wire);
+      dispatchNative(primaryWindow, controlKey, wire);
+      dispatchNative(otherWindow, controlKey, wire);
+      dispatchNative(otherWindow, controlKey, wire);
+    }
+    const expected = [
+      { type: 'change', operation: 'update', key: 'item', driver: 'localStorage', namespace: 'native-legacy', source: 'remote' },
+      { type: 'remove', operation: 'remove', key: 'item', driver: 'localStorage', namespace: 'native-legacy', source: 'remote' },
+      { type: 'clear', operation: 'clear', driver: 'localStorage', namespace: 'native-legacy', source: 'remote' },
+    ];
+    for (const received of seen) {
+      assert.deepEqual(received, expected);
+      assert.equal(received.every(Object.isFrozen), true);
+    }
+  });
+
+  it('keeps legacy ids distinct from current instance-event pairs', () => {
+    const events = create('localStorage', 'native-identities', true);
+    let changes = 0;
+    events.on('clear', () => { changes++; });
+    const controlKey = 'nexusstorage:events:1:["localStorage","native-identities"]';
+    const legacy = { id: 'shared-id', type: 'clear', operation: 'clear', driver: 'localStorage', namespace: 'native-identities', source: 'local' };
+    const current = { ...legacy, instanceId: 'new-instance', eventId: 'shared-id' };
+    for (const message of [legacy, legacy, current, current]) dispatchNative(primaryWindow, controlKey, JSON.stringify(message));
+    assert.equal(changes, 2);
+  });
+
+  it('rejects partial or invalid current identities instead of falling back to a legacy id', () => {
+    const events = create('localStorage', 'native-legacy-validation', true);
+    const seen: StorageEvent[] = [];
+    events.on('clear', event => { seen.push(event); });
+    const controlKey = 'nexusstorage:events:1:["localStorage","native-legacy-validation"]';
+    const legacy = { id: 'legacy-valid', type: 'clear', operation: 'clear', driver: 'localStorage', namespace: 'native-legacy-validation', source: 'local' };
+    for (const fields of [
+      { instanceId: 'writer' }, { eventId: 'event' },
+      { instanceId: '', eventId: 'event' }, { instanceId: 'writer', eventId: '' },
+      { instanceId: null, eventId: 'event' }, { instanceId: 'writer', eventId: null },
+      { instanceId: 1, eventId: 'event' }, { instanceId: 'writer', eventId: 1 },
+      { instanceId: {}, eventId: [] },
+      { id: '' }, { id: null }, { id: 1 }, { id: undefined },
+      { driver: 'indexedDB' }, { namespace: 'other' }, { source: 'remote' },
+      { type: 'remove' }, { key: 'not-allowed-on-clear' },
+    ]) dispatchNative(primaryWindow, controlKey, JSON.stringify({ ...legacy, ...fields }));
+    dispatchNative(primaryWindow, controlKey, JSON.stringify(legacy), storageNetwork.createWindow().localStorage);
+    dispatchNative(primaryWindow, 'other-control-key', JSON.stringify(legacy));
+    assert.deepEqual(seen, []);
+    dispatchNative(primaryWindow, controlKey, JSON.stringify(legacy));
+    assert.deepEqual(seen, [
+      { type: 'clear', operation: 'clear', driver: 'localStorage', namespace: 'native-legacy-validation', source: 'remote' },
+    ]);
   });
 
   it('bounds native replay history while accepting new events from a long-lived writer', () => {
