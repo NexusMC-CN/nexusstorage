@@ -23,7 +23,8 @@ interface StorageChange {
 }
 
 interface NativeMessage extends StorageChange {
-  instanceId: string;
+  // The previous v1 envelope has only an id; it cannot identify a sender instance.
+  instanceId?: string;
   eventId: string;
 }
 
@@ -53,7 +54,8 @@ interface NativeStorageChannel {
 const nativeGroups = new WeakMap<Window, Map<string, NativeStorageGroup>>();
 
 function dispatchNative(group: NativeStorageGroup, message: NativeMessage, sender?: NativeSubscriber): void {
-  const identity = JSON.stringify([message.instanceId, message.eventId]);
+  // Legacy ids occupy a separate identity space from current instance/event pairs.
+  const identity = JSON.stringify([message.instanceId ?? null, message.eventId]);
   if (group.seen.has(identity)) return;
   group.seen.add(identity);
   if (group.seen.size > 256) group.seen.delete(group.seen.values().next().value!);
@@ -67,7 +69,8 @@ function dispatchNative(group: NativeStorageGroup, message: NativeMessage, sende
         try {
           // Queue the native notification before listeners can reenter publication.
           group.storage.setItem(group.key, JSON.stringify({
-            ...next.message, driver: 'localStorage', namespace: group.namespace, source: 'local',
+            ...next.message, id: next.message.eventId,
+            driver: 'localStorage', namespace: group.namespace, source: 'local',
           }));
         } catch {
           // Transport failures cannot undo a committed write or prevent same-page delivery.
@@ -183,11 +186,19 @@ export class StorageEvents {
               const message: unknown = JSON.parse(event.newValue);
               if (!message || typeof message !== 'object' || Array.isArray(message)) return;
               const envelope = message as Record<string, unknown>;
-              if (envelope.driver !== 'localStorage' || envelope.namespace !== created.namespace || envelope.source !== 'local'
-                || typeof envelope.instanceId !== 'string' || envelope.instanceId.length === 0
-                || typeof envelope.eventId !== 'string' || envelope.eventId.length === 0) return;
+              if (envelope.driver !== 'localStorage' || envelope.namespace !== created.namespace || envelope.source !== 'local') return;
+              let identity: { instanceId?: string; eventId: string };
+              if (Object.hasOwn(envelope, 'instanceId') || Object.hasOwn(envelope, 'eventId')) {
+                // A partial or invalid current identity must never fall back to legacy id validation.
+                if (typeof envelope.instanceId !== 'string' || envelope.instanceId.length === 0
+                  || typeof envelope.eventId !== 'string' || envelope.eventId.length === 0) return;
+                identity = { instanceId: envelope.instanceId, eventId: envelope.eventId };
+              } else {
+                if (typeof envelope.id !== 'string' || envelope.id.length === 0) return;
+                identity = { eventId: envelope.id };
+              }
               const change = readChange(message);
-              if (change) dispatchNative(created, { ...change, instanceId: envelope.instanceId, eventId: envelope.eventId });
+              if (change) dispatchNative(created, { ...change, ...identity });
             } catch {
               // Foreign or malformed control entries are not storage notifications.
             }

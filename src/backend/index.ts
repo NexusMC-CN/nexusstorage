@@ -11,7 +11,7 @@ export interface StorageBackend {
   atomic?<T>(keys: readonly string[], transform: (transaction: RawTransaction) => T): Promise<T>;
   remove(key: string): Promise<boolean>;
   keys(): Promise<string[]>;
-  scan?(): Promise<Array<{ key: string; value: string }>>;
+  scan?(visit: (entry: { key: string; value: string }) => void): Promise<void>;
   clear(): Promise<void>;
   close(): Promise<void>;
 }

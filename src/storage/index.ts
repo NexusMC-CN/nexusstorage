@@ -210,9 +210,9 @@ export class NexusStorage<S extends StorageSchemas = Record<never, never>> {
     return this.enqueue(async () => {
       const live: string[] = [];
       if (this.backend.scan) {
-        for (const { key, value } of await this.backend.scan()) {
+        await this.backend.scan(({ key, value }) => {
           if (!isExpired(decodeRecord(value), Date.now())) live.push(key);
-        }
+        });
         return live.sort();
       }
       for (const key of await this.backend.keys()) {
