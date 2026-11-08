@@ -13,6 +13,16 @@ function keyURL(key: string): string {
   return KEY_URL_PREFIX + encodeURIComponent(JSON.stringify(key));
 }
 
+function contentType(value: string): string {
+  if (/^NexusStorage\/\d+\n/.test(value)) return 'application/x.nexusstorage-record; charset=utf-8';
+  try {
+    JSON.parse(value);
+    return 'application/json; charset=utf-8';
+  } catch {
+    return 'text/plain; charset=utf-8';
+  }
+}
+
 export class CacheStorageBackend implements StorageBackend {
   readonly #name: string;
   #closed = false;
@@ -50,10 +60,14 @@ export class CacheStorageBackend implements StorageBackend {
     }
   }
 
-  async #ownedEntries(cache: Cache): Promise<Array<{ key: string; request: Request }>> {
+  async #ownedEntries(cache: Cache, rejectConflicts = false): Promise<Array<{ key: string; request: Request }>> {
     const entries: Array<{ key: string; request: Request }> = [];
+    const fragmentURLs = new Set<string>();
     for (const request of await cache.keys()) {
-      if (request.method !== 'GET' || !request.url.startsWith(KEY_URL_PREFIX)) continue;
+      if (request.method !== 'GET') continue;
+      const baseURL = request.url.split('#', 1)[0]!;
+      if (baseURL !== request.url) fragmentURLs.add(baseURL);
+      if (!request.url.startsWith(KEY_URL_PREFIX)) continue;
       try {
         const key: unknown = JSON.parse(decodeURIComponent(request.url.slice(KEY_URL_PREFIX.length)));
         if (typeof key === 'string' && keyURL(key) === request.url) entries.push({ key, request });
@@ -61,13 +75,19 @@ export class CacheStorageBackend implements StorageBackend {
         // Foreign resources and malformed/noncanonical keys do not belong to this backend.
       }
     }
+    // Validate the complete snapshot before reading responses or deleting any entry.
+    if (rejectConflicts && entries.some(({ request }) => fragmentURLs.has(request.url))) {
+      throw new NexusStorageError('CORRUPT_DATA', 'A noncanonical Cache Storage entry conflicts with this key.');
+    }
     return entries;
   }
 
-  async #assertNoKeyConflict(cache: Cache, url: string): Promise<void> {
+  async #assertNoKeyConflict(cache: Cache, canonical: Request): Promise<void> {
     // Cache match/put/delete ignore fragments, but fragment URLs are not owned keys.
-    for (const request of await cache.keys()) {
-      if (request.method === 'GET' && request.url !== url && request.url.split('#', 1)[0] === url) {
+    // Vary must not hide foreign variants from this ownership check.
+    // Supplying the request limits returned entries; browser lookup complexity is unspecified.
+    for (const request of await cache.keys(canonical, { ignoreVary: true })) {
+      if (request.method === 'GET' && request.url !== canonical.url && request.url.split('#', 1)[0] === canonical.url) {
         throw new NexusStorageError('CORRUPT_DATA', 'A noncanonical Cache Storage entry conflicts with this key.');
       }
     }
@@ -75,34 +95,33 @@ export class CacheStorageBackend implements StorageBackend {
 
   async get(key: string): Promise<string | undefined> {
     return this.#execute(async (cache, api) => {
-      const url = keyURL(key);
-      await this.#assertNoKeyConflict(cache, url);
-      const response = await cache.match(new api.Request(url));
+      const request = new api.Request(keyURL(key));
+      await this.#assertNoKeyConflict(cache, request);
+      const response = await cache.match(request);
       return response ? response.text() : undefined;
     });
   }
 
   async set(key: string, value: string): Promise<void> {
     return this.#execute(async (cache, api) => {
-      const url = keyURL(key);
-      await this.#assertNoKeyConflict(cache, url);
-      await cache.put(new api.Request(url), new api.Response(value, {
-        headers: { 'content-type': 'application/json; charset=utf-8' },
+      const request = new api.Request(keyURL(key));
+      await this.#assertNoKeyConflict(cache, request);
+      await cache.put(request, new api.Response(value, {
+        headers: { 'content-type': contentType(value) },
       }));
     });
   }
 
   async update(key: string, transform: (raw: string | undefined) => string): Promise<string> {
     return this.#execute(async (cache, api) => {
-      const url = keyURL(key);
-      await this.#assertNoKeyConflict(cache, url);
-      const request = new api.Request(url);
+      const request = new api.Request(keyURL(key));
+      await this.#assertNoKeyConflict(cache, request);
       const response = await cache.match(request);
       const updated = transform(response ? await response.text() : undefined);
       // Cache Storage has no transaction spanning this read and write across instances.
-      await this.#assertNoKeyConflict(cache, url);
+      await this.#assertNoKeyConflict(cache, request);
       await cache.put(request, new api.Response(updated, {
-        headers: { 'content-type': 'application/json; charset=utf-8' },
+        headers: { 'content-type': contentType(updated) },
       }));
       return updated;
     });
@@ -110,9 +129,9 @@ export class CacheStorageBackend implements StorageBackend {
 
   async remove(key: string): Promise<boolean> {
     return this.#execute(async (cache, api) => {
-      const url = keyURL(key);
-      await this.#assertNoKeyConflict(cache, url);
-      return cache.delete(new api.Request(url));
+      const request = new api.Request(keyURL(key));
+      await this.#assertNoKeyConflict(cache, request);
+      return cache.delete(request);
     });
   }
 
@@ -120,10 +139,22 @@ export class CacheStorageBackend implements StorageBackend {
     return this.#execute(async cache => (await this.#ownedEntries(cache)).map(entry => entry.key).sort());
   }
 
+  async scan(): Promise<Array<{ key: string; value: string }>> {
+    return this.#execute(async cache => {
+      const entries = await this.#ownedEntries(cache, true);
+      const values: Array<{ key: string; value: string }> = [];
+      for (const { key, request } of entries) {
+        const response = await cache.match(request);
+        if (response) values.push({ key, value: await response.text() });
+      }
+      return values;
+    });
+  }
+
   async clear(): Promise<void> {
     return this.#execute(async cache => {
-      for (const { request } of await this.#ownedEntries(cache)) {
-        await this.#assertNoKeyConflict(cache, request.url);
+      // This snapshot has no transaction with deletion across Cache Storage users.
+      for (const { request } of await this.#ownedEntries(cache, true)) {
         await cache.delete(request);
       }
     });

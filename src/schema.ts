@@ -44,9 +44,13 @@ export namespace StandardSchemaV1 {
 export type StorageSchemas = Record<string, StandardSchemaV1>;
 export type InferSchemaInput<S extends StandardSchemaV1> = NonNullable<S['~standard']['types']>['input'];
 export type InferSchemaOutput<S extends StandardSchemaV1> = NonNullable<S['~standard']['types']>['output'];
+/** Optional validators for the normalized output stored under each configured key. */
+export type StoredSchemas<S extends StorageSchemas> = keyof S extends never ? Record<string, never> : {
+  readonly [K in keyof S]?: StandardSchemaV1<InferSchemaOutput<S[K]>, InferSchemaOutput<S[K]>>;
+};
 
 /** Capture keys and validator functions without reading map accessors or inherited keys. */
-export function snapshotSchemas(schemas?: StorageSchemas): ReadonlyMap<string, StandardSchemaV1> {
+export function snapshotSchemas(schemas?: Readonly<Record<string, StandardSchemaV1 | undefined>>): ReadonlyMap<string, StandardSchemaV1> {
   const snapshot = new Map<string, StandardSchemaV1>();
   if (schemas === undefined) return snapshot;
 
@@ -136,4 +140,28 @@ export function validateSchema(schema: StandardSchemaV1 | undefined, value: unkn
   }
   if (issues !== undefined) validationFailure(issues);
   return snapshotJson(output);
+}
+
+function equalJson(left: JsonValue, right: JsonValue): boolean {
+  if (left === right) return true;
+  if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return false;
+  if (Array.isArray(left)) {
+    return Array.isArray(right) && left.length === right.length && left.every((item, index) => equalJson(item, right[index]!));
+  }
+  if (Array.isArray(right)) return false;
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length
+    && keys.every(key => Object.hasOwn(right, key) && equalJson(left[key]!, right[key]!));
+}
+
+/** Stored validation must accept the value without converting it a second time. */
+export function validateStoredSchema(schema: StandardSchemaV1 | undefined, value: unknown): JsonValue {
+  const stored = snapshotJson(value);
+  if (schema === undefined) return stored;
+  const checked = validateSchema(schema, stored);
+  if (!equalJson(stored, checked)) {
+    throw new NexusStorageError('VALIDATION_ERROR',
+      'Stored validators must preserve the JSON value. Configure storedSchemas separately from input transforms.');
+  }
+  return stored;
 }

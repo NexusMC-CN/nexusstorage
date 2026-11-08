@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 import { CacheStorageBackend } from '../../src/backend/cache.js';
+import { NexusStorage } from '../../src/index.js';
 import { NexusStorageError } from '../../src/errors.js';
 import { MemoryCacheStorage } from '../helpers/memory/cache.js';
 
@@ -68,6 +69,92 @@ test('stores the declared JSON content type and canonical URL for an empty key',
   assert.ok(response);
   assert.equal(response.headers.get('content-type'), 'application/json; charset=utf-8');
   assert.equal(await response.text(), '{"value":1}');
+});
+
+test('the memory Cache helper filters keys by request method and URL while ignoring fragments', async () => {
+  const cache = await caches.open('helper');
+  const fragment = 'https://nexusstorage.invalid/v1/%22a%22#external';
+  await cache.put(fragment, new Response('external'));
+  await cache.put('https://example.test/unrelated', new Response('unrelated'));
+  assert.deepEqual((await cache.keys(new Request('https://nexusstorage.invalid/v1/%22a%22'))).map(request => request.url), [fragment]);
+  assert.deepEqual(await cache.keys(new Request(fragment, { method: 'POST' })), []);
+});
+
+test('the memory Cache helper applies Vary unless query options explicitly ignore it', async () => {
+  const cache = await caches.open('varyHelper');
+  const fragment = 'https://nexusstorage.invalid/v1/%22a%22#external';
+  const externalRequest = new Request(fragment, { headers: { 'X-Language': 'zh' } });
+  await cache.put(externalRequest, new Response('external', { headers: { Vary: 'X-Language' } }));
+  assert.deepEqual(await cache.keys(new Request('https://nexusstorage.invalid/v1/%22a%22')), []);
+  assert.deepEqual((await cache.keys(new Request(fragment, { headers: { 'X-Language': 'en' } }))).map(request => request.url), []);
+  assert.deepEqual((await cache.keys(externalRequest)).map(request => request.url), [fragment]);
+  assert.deepEqual((await cache.keys(new Request('https://nexusstorage.invalid/v1/%22a%22'), { ignoreVary: true })).map(request => request.url), [fragment]);
+});
+
+test('the memory Cache helper honors ignoreSearch and ignoreMethod query options', async () => {
+  const cache = await caches.open('queryHelper');
+  const url = 'https://example.test/item?stored=1#fragment';
+  await cache.put(url, new Response('external'));
+  assert.deepEqual(await cache.keys('https://example.test/item?other=1'), []);
+  assert.deepEqual((await cache.keys('https://example.test/item?other=1', { ignoreSearch: true })).map(request => request.url), [url]);
+  assert.deepEqual((await cache.keys(new Request(url, { method: 'POST' }), { ignoreMethod: true })).map(request => request.url), [url]);
+});
+
+test('TTL records use the internal record media type on set and update with real Response bodies', async () => {
+  const store = new NexusStorage({ driver: 'cacheStorage', namespace: 'media' });
+  try {
+    await store.set('item', { n: 1 }, { ttl: 60_000 });
+    const cache = await caches.open('nexusstorage:"media"');
+    const url = 'https://nexusstorage.invalid/v1/%22item%22';
+    const initial = await cache.match(new Request(url));
+    assert.ok(initial instanceof Response);
+    assert.equal(initial.headers.get('content-type'), 'application/x.nexusstorage-record; charset=utf-8');
+    assert.match(await initial.text(), /^NexusStorage\/1\n/);
+    assert.deepEqual(await store.update('item', { n: 2 }), { n: 2 });
+    const updated = await cache.match(new Request(url));
+    assert.ok(updated instanceof Response);
+    assert.equal(updated.headers.get('content-type'), 'application/x.nexusstorage-record; charset=utf-8');
+    assert.match(await updated.text(), /^NexusStorage\/1\n/);
+    assert.deepEqual(await store.get('item'), { n: 2 });
+  } finally { await store.close(); }
+});
+
+test('internal record versions use the record media type while plain JSON keeps its JSON media type', async () => {
+  const backend = new CacheStorageBackend('media');
+  const cache = await caches.open('nexusstorage:"media"');
+  for (const raw of ['NexusStorage/1\n{"value":1,"expiresAt":0}', 'NexusStorage/2\n{"value":1,"revision":"r"}']) {
+    await backend.set('record', raw);
+    assert.equal((await cache.match('https://nexusstorage.invalid/v1/%22record%22'))?.headers.get('content-type'),
+      'application/x.nexusstorage-record; charset=utf-8');
+    assert.equal(await backend.get('record'), raw);
+  }
+  await backend.update('record', () => '{"plain":true}');
+  const response = await cache.match('https://nexusstorage.invalid/v1/%22record%22');
+  assert.equal(response?.headers.get('content-type'), 'application/json; charset=utf-8');
+  assert.deepEqual(await response?.json(), { plain: true });
+});
+
+test('raw non-JSON backend strings are labeled as text rather than JSON', async () => {
+  const backend = new CacheStorageBackend('rawMedia');
+  const cache = await caches.open('nexusstorage:"rawMedia"');
+  for (const raw of ['', 'arbitrary text']) {
+    await backend.set('raw', raw);
+    const response = await cache.match('https://nexusstorage.invalid/v1/%22raw%22');
+    assert.equal(response?.headers.get('content-type'), 'text/plain; charset=utf-8');
+    assert.equal(await response?.text(), raw);
+  }
+});
+
+test('legacy prefixed records previously labeled JSON remain readable without rewriting', async () => {
+  const store = new NexusStorage({ driver: 'cacheStorage', namespace: 'legacyMedia' });
+  try {
+    const cache = await caches.open('nexusstorage:"legacyMedia"');
+    const url = 'https://nexusstorage.invalid/v1/%22item%22';
+    const raw = 'NexusStorage/1\n{"value":{"old":true},"expiresAt":9007199254740991}';
+    await cache.put(new Request(url), new Response(raw, { headers: { 'content-type': 'application/json; charset=utf-8' } }));
+    assert.deepEqual(await store.get('item'), { old: true });
+    assert.equal(await (await cache.match(url))?.text(), raw);
+  } finally { await store.close(); }
 });
 
 test('replaces values and shares persisted data across instances', async () => {
@@ -170,6 +257,24 @@ for (const operationName of ['get', 'set', 'update', 'remove'] as const) {
     assert.equal(transformed, false);
     assert.deepEqual((await cache.keys()).map(request => request.url), [externalURL]);
     assert.equal(await (await match(externalURL))?.text(), '{"external":true}');
+  });
+
+  test(`${operationName} rejects a fragment URL conflict hidden by a Vary header mismatch`, async () => {
+    const backend = new CacheStorageBackend('varyConflict');
+    const cache = await caches.open('nexusstorage:"varyConflict"');
+    const canonical = new Request('https://nexusstorage.invalid/v1/%22a%22');
+    const externalRequest = new Request(canonical.url + '#external', { headers: { 'X-Language': 'zh' } });
+    await cache.put(externalRequest, new Response('{"external":true}', { headers: { Vary: 'X-Language' } }));
+    assert.deepEqual(await cache.keys(canonical), [], 'The fixture must exercise a real Vary mismatch.');
+    const operations = {
+      get: () => backend.get('a'),
+      set: () => backend.set('a', '{"owned":true}'),
+      update: () => backend.update('a', () => '{"owned":true}'),
+      remove: () => backend.remove('a'),
+    };
+    await assert.rejects(operations[operationName](), errorCode('CORRUPT_DATA'));
+    assert.deepEqual((await cache.keys()).map(request => request.url), [externalRequest.url]);
+    assert.equal(await (await cache.match(externalRequest))?.text(), '{"external":true}');
   });
 }
 

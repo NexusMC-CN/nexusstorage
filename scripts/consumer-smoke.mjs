@@ -187,7 +187,11 @@ module.exports = async function verify({ NexusStorage, NexusStorageError }, form
         error instanceof NexusStorageError && error.code === 'VALIDATION_ERROR');
       await assert.rejects(storage.update('profile', { visits: -1 }), error =>
         error instanceof NexusStorageError && error.code === 'VALIDATION_ERROR');
-      assert.deepEqual(await storage.update('profile', { name: ' Sam ' }), { name: 'Sam', visits: 1 });
+      // Patches use the output shape; stored validation must not silently trim them.
+      await assert.rejects(storage.update('profile', { name: ' Sam ' }), error =>
+        error instanceof NexusStorageError && error.code === 'VALIDATION_ERROR');
+      assert.deepEqual(await storage.get('profile'), { name: 'Alex', visits: 1 });
+      assert.deepEqual(await storage.update('profile', { name: 'Sam' }), { name: 'Sam', visits: 1 });
       now = 1_099;
       assert.equal(await storage.has('profile'), true);
       now = 1_100;
@@ -225,6 +229,101 @@ module.exports = async function verify({ NexusStorage, NexusStorageError }, form
       Date.now = realNow;
       await storage.clear();
       await storage.close();
+    }
+  }
+  // Input transforms and storage validation remain separate in the actual tarball.
+  const schema = validate => ({ '~standard': { version: 1, vendor: 'consumer-review', validate } });
+  const numberStored = schema(value => typeof value === 'number' && Number.isFinite(value)
+    ? { value } : { issues: [{ message: 'Expected stored number' }] });
+  const stringLength = schema(value => typeof value === 'string'
+    ? { value: value.length } : { issues: [{ message: 'Expected string input' }] });
+  const increment = schema(value => typeof value === 'number'
+    ? { value: value + 1 } : { issues: [{ message: 'Expected number input' }] });
+  const validationError = error => error instanceof NexusStorageError && error.code === 'VALIDATION_ERROR';
+  const extraStoredSchemas = { length: numberStored, absent: numberStored };
+  assert.throws(() => new NexusStorage({ driver: 'memory', schemas: { length: stringLength }, storedSchemas: extraStoredSchemas }),
+    error => error instanceof NexusStorageError && error.code === 'INVALID_OPTIONS');
+  for (const driver of [...drivers, 'memory']) {
+    let inputCalls = 0;
+    let alterStored = false;
+    const objectInput = schema(value => {
+      inputCalls++;
+      return value && typeof value.name === 'string' && Number.isInteger(value.visits)
+        ? { value: { name: value.name + '!', visits: value.visits, settings: value.settings } }
+        : { issues: [{ message: 'Expected input profile' }] };
+    });
+    const objectStored = schema(value => value && typeof value.name === 'string' && Number.isInteger(value.visits)
+      && value.visits >= 0 && value.settings && typeof value.settings === 'object'
+      ? { value: { settings: value.settings, visits: value.visits, name: alterStored ? value.name + '?' : value.name } }
+      : { issues: [{ message: 'Expected stored profile' }] });
+    const namespace = 'review-' + format + '-' + driver;
+    const storage = new NexusStorage({ driver, namespace,
+      schemas: { length: stringLength, increment, profile: objectInput },
+      storedSchemas: { length: numberStored, increment: numberStored, profile: objectStored } });
+    const events = [];
+    storage.on('change', event => events.push(event));
+    try {
+      assert.equal(await storage.set('length', 'hello'), 5);
+      assert.equal(await storage.get('length'), 5);
+      assert.equal(await storage.set('increment', 1), 2);
+      assert.equal(await storage.get('increment'), 2);
+      await storage.set('profile', { name: 'Alex', visits: 1, settings: { theme: 'light', language: 'zh' } }, { ttl: 60_000 });
+      const before = await storage.getEntry('profile');
+      assert.deepEqual(await storage.update('profile', { visits: 2, settings: { theme: 'dark' } }),
+        { name: 'Alex!', visits: 2, settings: { theme: 'dark' } });
+      const updated = await storage.getEntry('profile');
+      assert.equal(updated.expiresAt, before.expiresAt);
+      assert.equal(inputCalls, 1, driver + ': reads and updates never rerun explicit input conversion');
+      const eventCount = events.length;
+      await assert.rejects(storage.update('profile', { visits: -1 }), validationError);
+      alterStored = true;
+      await assert.rejects(storage.get('profile'), validationError);
+      await assert.rejects(storage.set('profile', { name: 'Bad', visits: 1, settings: {} }), validationError);
+      alterStored = false;
+      assert.deepEqual(await storage.getEntry('profile'), updated);
+      assert.equal(events.length, eventCount);
+      if (driver !== 'memory') {
+        const legacy = new NexusStorage({ driver, namespace });
+        try {
+          await legacy.set('profile', { name: false, visits: 2, settings: {} }, { ttl: 60_000 });
+          const invalid = await legacy.getEntry('profile');
+          await assert.rejects(storage.get('profile'), validationError);
+          assert.deepEqual(await legacy.getEntry('profile'), invalid, driver + ': failed historical read never rewrites data');
+          await legacy.set('profile', updated.value, { expiresAt: updated.expiresAt });
+        } finally { await legacy.close(); }
+      }
+      if (driver === 'memory' || driver === 'indexedDB') {
+        const swapped = await storage.compareAndSwap('length', (await storage.getEntry('length')).revision, 'xy');
+        assert.equal(swapped.value, 2);
+        assert.equal(await storage.get('length'), 2);
+        assert.deepEqual(await storage.transaction(['profile', 'length', 'increment'], tx => {
+          const length = tx.get('length');
+          tx.set('increment', 5);
+          tx.update('profile', { visits: 3 });
+          return [length, tx.get('increment'), tx.get('profile').name];
+        }), [2, 6, 'Alex!']);
+        const committed = await storage.getEntry('profile');
+        const committedEvents = events.length;
+        await assert.rejects(storage.transaction(['profile', 'increment'], tx => {
+          tx.set('increment', 100);
+          tx.update('profile', { visits: -1 });
+        }), validationError);
+        assert.equal(await storage.get('increment'), 6);
+        assert.deepEqual(await storage.getEntry('profile'), committed);
+        assert.equal(events.length, committedEvents);
+      }
+    } finally { await storage.clear(); await storage.close(); }
+    for (const [name, input, validator] of [['length', 'abc', stringLength], ['increment', 1, increment]]) {
+      const unsafe = new NexusStorage({ driver, namespace: namespace + '-' + name, schemas: { value: validator } });
+      try {
+        await assert.rejects(unsafe.set('value', input), validationError);
+        assert.equal(await unsafe.has('value'), false, driver + ': invalid fallback output must fail before writing');
+        if (driver === 'memory' || driver === 'indexedDB') {
+          await assert.rejects(unsafe.compareAndSwap('value', null, input), validationError);
+          await assert.rejects(unsafe.transaction(['value'], tx => tx.set('value', input)), validationError);
+          assert.equal(await unsafe.has('value'), false);
+        }
+      } finally { await unsafe.clear(); await unsafe.close(); }
     }
   }
   for (const driver of [...drivers, 'memory']) {
@@ -368,7 +467,7 @@ module.exports = async function verify({ NexusStorage, NexusStorageError }, form
       await storage.close();
     }
   }
-  console.log(format + ': five-driver JSON/TTL/schema/capabilities/events, Memory/IDB CAS/transactions, and three unsupported-driver contracts passed (browser APIs simulated)');
+  console.log(format + ': five-driver JSON/TTL/input+stored schemas/capabilities/events, Memory/IDB CAS/transactions, and three unsupported-driver contracts passed (browser APIs simulated)');
 };
 `;
 
@@ -377,6 +476,7 @@ type JsonObject = import('@nexusmc-cn/nexusstorage').JsonObject;
 type StorageDriver = import('@nexusmc-cn/nexusstorage').StorageDriver;
 type StandardSchemaV1<Input = unknown, Output = Input> = import('@nexusmc-cn/nexusstorage').StandardSchemaV1<Input, Output>;
 type StorageSchemas = import('@nexusmc-cn/nexusstorage').StorageSchemas;
+type StoredSchemas<S extends StorageSchemas> = import('@nexusmc-cn/nexusstorage').StoredSchemas<S>;
 type InferSchemaInput<S extends StandardSchemaV1> = import('@nexusmc-cn/nexusstorage').InferSchemaInput<S>;
 type InferSchemaOutput<S extends StandardSchemaV1> = import('@nexusmc-cn/nexusstorage').InferSchemaOutput<S>;
 type WriteOptions = import('@nexusmc-cn/nexusstorage').WriteOptions;
@@ -455,6 +555,49 @@ const typedUpdated: Promise<Profile> = typed.update('profile', { name: 'Sam' }, 
 const converted: Promise<number> = typed.set('count', typedInput);
 const convertedRead: Promise<number | undefined> = typed.get('count');
 void typed.set('count', typedOutput);
+
+const stringLengthSchema: StandardSchemaV1<string, number> = {
+  '~standard': { version: 1, vendor: 'consumer-review', validate(value) {
+    return typeof value === 'string' ? { value: value.length } : { issues: [{ message: 'Expected string' }] };
+  } },
+};
+const storedNumberSchema: StandardSchemaV1<number> = {
+  '~standard': { version: 1, vendor: 'consumer-review', validate(value) {
+    return typeof value === 'number' ? { value } : { issues: [{ message: 'Expected number' }] };
+  } },
+};
+const transformSchemas = { length: stringLengthSchema, profile: profileSchema };
+const storedSchemas = { length: storedNumberSchema } satisfies StoredSchemas<typeof transformSchemas>;
+const transformed = new NexusStorage({ driver: 'memory', schemas: transformSchemas, storedSchemas });
+const transformedWrite: Promise<number> = transformed.set('length', 'hello');
+const transformedRead: Promise<number | undefined> = transformed.get('length');
+const transformedEntry: Promise<StorageEntry<number> | undefined> = transformed.getEntry('length');
+const transformedSwap: Promise<StorageEntry<number>> = transformed.compareAndSwap('length', null, 'hello');
+const transformedTransaction: Promise<number | undefined> = transformed.transaction(['length', 'profile'], tx => {
+  const written: number = tx.set('length', 'hello');
+  const read: number | undefined = tx.get('length');
+  const patched: Profile = tx.update('profile', { name: 'Sam' });
+  void written; void patched;
+  return read;
+});
+void transformedWrite; void transformedRead; void transformedEntry; void transformedSwap; void transformedTransaction;
+// @ts-expect-error Input types remain string after adding a number storage validator.
+void transformed.set('length', 5);
+// @ts-expect-error A stored schema can only use an already declared input-schema key.
+void new NexusStorage({ schemas: { length: stringLengthSchema }, storedSchemas: { absent: storedNumberSchema } });
+// @ts-expect-error Storage validators require matching input schemas.
+void new NexusStorage({ storedSchemas: { length: storedNumberSchema } });
+// @ts-expect-error A string input validator cannot validate a numeric stored value.
+void new NexusStorage({ schemas: { length: stringLengthSchema }, storedSchemas: { length: stringLengthSchema } });
+const changesStoredType = {} as StandardSchemaV1<number, string>;
+// @ts-expect-error Stored validator output must retain the input schema's numeric output type.
+void new NexusStorage({ schemas: { length: stringLengthSchema }, storedSchemas: { length: changesStoredType } });
+const unknownStoredOutput = {} as StandardSchemaV1<number, unknown>;
+// @ts-expect-error Unknown storage-validator output cannot erase the numeric output contract.
+void new NexusStorage({ schemas: { length: stringLengthSchema }, storedSchemas: { length: unknownStoredOutput } });
+const unknownStoredTypes = {} as StandardSchemaV1;
+// @ts-expect-error An untyped validator cannot bypass a typed storage-output contract.
+void new NexusStorage({ schemas: { length: stringLengthSchema }, storedSchemas: { length: unknownStoredTypes } });
 void typed.has('profile');
 void typed.remove('count');
 void typedWritten; void typedRead; void typedUpdated; void converted; void convertedRead;

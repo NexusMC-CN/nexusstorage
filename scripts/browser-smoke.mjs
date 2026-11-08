@@ -420,8 +420,11 @@ try {
   const originalChecks = results.length;
   assert.equal(originalChecks, 210, 'All existing browser checks must remain enabled');
   await runSecondStageBrowserChecks({ page, secondPage, results });
+  const existingChecks = results.length;
+  assert.equal(existingChecks, 312, 'All previous stages must remain enabled');
+  await (await import('./browser-review.mjs')).runReviewBrowserChecks({ page, secondPage, results });
   assert.deepEqual(errors, []);
-  console.log(`Chromium ${browser.version()}: ${results.length} browser checks passed (${originalChecks} existing, ${results.length - originalChecks} second-stage).`);
+  console.log(`Chromium ${browser.version()}: ${results.length} browser checks passed (${existingChecks} existing, ${results.length - existingChecks} review regressions).`);
 } finally {
   if (browser) await browser.close();
   await new Promise(resolve => server.close(resolve));
