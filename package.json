@@ -1,0 +1,63 @@
+{
+  "name": "@nexusmc-cn/nexusstorage",
+  "version": "0.1.0",
+  "description": "A typed JSON storage API with Memory, browser storage, TTL and Standard Schema validation.",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NexusMC-CN/nexusstorage.git"
+  },
+  "keywords": [
+    "storage",
+    "localStorage",
+    "sessionStorage",
+    "indexedDB",
+    "cacheStorage",
+    "memory",
+    "ttl",
+    "standard-schema",
+    "json",
+    "typescript"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"tests/**/*.test.ts\"",
+    "test:consumer": "node scripts/consumer-smoke.mjs",
+    "test:browser": "npm run build && node scripts/browser-smoke.mjs",
+    "check": "npm run typecheck && npm test && npm run build && npm run test:consumer",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "fake-indexeddb": "^6.2.7",
+    "playwright": "^1.65.0",
+    "tsup": "^9.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3"
+  }
+}
