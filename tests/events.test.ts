@@ -113,6 +113,12 @@ describe('storage events', () => {
     return new TestBroadcastChannel(receiver.name);
   }
 
+  function dispatchNative(target: TestWindow, key: string, newValue: string | null, storageArea: Storage = target.localStorage): void {
+    const event = new Event('storage');
+    Object.defineProperties(event, { key: { value: key }, newValue: { value: newValue }, storageArea: { value: storageArea } });
+    target.dispatchEvent(event);
+  }
+
   beforeEach(() => {
     TestBroadcastChannel.failPost = false;
     Object.defineProperty(globalThis, 'BroadcastChannel', { configurable: true, value: TestBroadcastChannel });
@@ -213,6 +219,36 @@ describe('storage events', () => {
     first.on('change', event => { seen.push(event); });
     second.publish({ type: 'change', operation: 'set', key: 'item' });
     assert.deepEqual(seen, []);
+  });
+
+  it('keeps each subscription independent when the same callback is registered twice', () => {
+    const events = create();
+    let changes = 0;
+    const listener = () => { changes++; };
+    const first = events.on('change', listener);
+    const second = events.on('change', listener);
+    events.publish({ type: 'change', operation: 'set', key: 'both' });
+    assert.equal(changes, 2);
+    first();
+    first();
+    events.publish({ type: 'change', operation: 'set', key: 'second' });
+    assert.equal(changes, 3);
+    second();
+    events.publish({ type: 'change', operation: 'set', key: 'neither' });
+    assert.equal(changes, 3);
+  });
+
+  it('does not let an older unsubscribe delete a later listener group', () => {
+    const events = create();
+    const listener = () => {};
+    const first = events.on('change', listener);
+    const second = events.on('change', listener);
+    first();
+    let laterChanges = 0;
+    events.on('change', () => { laterChanges++; });
+    second();
+    events.publish({ type: 'change', operation: 'set', key: 'later' });
+    assert.equal(laterChanges, 1);
   });
 
   it('freezes a metadata copy before invoking listeners', () => {
@@ -430,21 +466,24 @@ describe('storage events', () => {
       { type: 'change', operation: 'set', key: 'item', driver: 'localStorage', namespace: 'native', source: 'remote' },
     ]);
     assert.equal(wires.length, 2);
-    assert.notEqual(wires[0]!.value.id, wires[1]!.value.id);
+    assert.notEqual(wires[0]!.value.eventId, wires[1]!.value.eventId);
+    assert.equal(wires[0]!.value.instanceId, wires[1]!.value.instanceId);
     for (const wire of wires) {
       assert.equal(wire.key, 'nexusstorage:events:1:["localStorage","native"]');
       assert.equal(wire.key.startsWith('nexusstorage:"native":'), false);
-      assert.deepEqual(Object.keys(wire.value).sort(), ['driver', 'id', 'key', 'namespace', 'operation', 'source', 'type']);
+      assert.deepEqual(Object.keys(wire.value).sort(), ['driver', 'eventId', 'instanceId', 'key', 'namespace', 'operation', 'source', 'type']);
       assert.equal(JSON.stringify(wire.value).includes('private'), false);
     }
     assert.equal(TestBroadcastChannel.channels.size, 0);
   });
 
-  it('limits native broadcasts to other windows in the exact namespace', async () => {
+  it('broadcasts within the same window and across windows in the exact namespace', async () => {
     const sender = create('localStorage', 'native:"scope"', true);
     const sameWindow = create('localStorage', 'native:"scope"', true);
-    const seen = { sameWindow: 0, sameNamespace: 0, otherNamespace: 0 };
+    const sameWindowOther = create('localStorage', 'native:"scope":', true);
+    const seen = { sameWindow: 0, sameWindowOther: 0, sameNamespace: 0, otherNamespace: 0 };
     sameWindow.on('remove', () => { seen.sameWindow++; });
+    sameWindowOther.on('remove', () => { seen.sameWindowOther++; });
     sender.prepare();
     useWindow(storageNetwork.createWindow());
     const exact = create('localStorage', 'native:"scope"', true);
@@ -452,8 +491,140 @@ describe('storage events', () => {
     exact.on('remove', () => { seen.sameNamespace++; });
     other.on('remove', () => { seen.otherNamespace++; });
     sender.publish({ type: 'remove', operation: 'remove', key: 'item' });
+    assert.deepEqual(seen, { sameWindow: 1, sameWindowOther: 0, sameNamespace: 0, otherNamespace: 0 });
     await new Promise(resolve => setImmediate(resolve));
-    assert.deepEqual(seen, { sameWindow: 0, sameNamespace: 1, otherNamespace: 0 });
+    assert.deepEqual(seen, { sameWindow: 1, sameWindowOther: 0, sameNamespace: 1, otherNamespace: 0 });
+  });
+
+  it('keeps broadcast disabled instances isolated from same-window peers', () => {
+    const sender = create('localStorage', 'native-opt-in', true);
+    const peer = create('localStorage', 'native-opt-in', true);
+    const isolated = create('localStorage', 'native-opt-in');
+    const seen = { sender: 0, peer: 0, isolated: 0 };
+    sender.on('change', () => { seen.sender++; });
+    peer.on('change', () => { seen.peer++; });
+    isolated.on('change', () => { seen.isolated++; });
+    sender.publish({ type: 'change', operation: 'set', key: 'broadcast' });
+    assert.deepEqual(seen, { sender: 1, peer: 1, isolated: 0 });
+    isolated.publish({ type: 'change', operation: 'set', key: 'private' });
+    assert.deepEqual(seen, { sender: 1, peer: 1, isolated: 1 });
+  });
+
+  it('delivers frozen same-window metadata without leaking values or echoing', () => {
+    const sender = create('localStorage', 'native-page-metadata', true);
+    const receiver = create('localStorage', 'native-page-metadata', true);
+    const seen: StorageEvent[] = [];
+    const local: StorageEvent[] = [];
+    sender.on('change', event => { local.push(event); });
+    receiver.on('change', event => { Reflect.set(event, 'key', 'tampered'); });
+    receiver.on('change', event => { seen.push(event); });
+    const change = { type: 'change' as const, operation: 'set' as const, key: 'original', value: { private: true } };
+    sender.publish(change);
+    assert.deepEqual(seen, [
+      { type: 'change', operation: 'set', key: 'original', driver: 'localStorage', namespace: 'native-page-metadata', source: 'remote' },
+    ]);
+    assert.equal(Object.isFrozen(seen[0]), true);
+    assert.equal(local.length, 1);
+    assert.equal(local[0]?.source, 'local');
+  });
+
+  it('deduplicates native replays of same-window messages without echoing or reposting', async () => {
+    const sender = create('localStorage', 'native-dedup', true);
+    const peer = create('localStorage', 'native-dedup', true);
+    let local = 0;
+    let remote = 0;
+    sender.on('change', () => { local++; });
+    peer.on('change', () => { remote++; });
+    const otherWindow = storageNetwork.createWindow();
+    const wires: string[] = [];
+    otherWindow.addEventListener('storage', event => {
+      const value = (event as globalThis.StorageEvent).newValue;
+      if (value !== null) wires.push(value);
+    });
+    sender.publish({ type: 'change', operation: 'set', key: 'item' });
+    assert.deepEqual({ local, remote }, { local: 1, remote: 1 });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(wires.length, 1);
+    const controlKey = 'nexusstorage:events:1:["localStorage","native-dedup"]';
+    dispatchNative(primaryWindow, controlKey, wires[0]!);
+    dispatchNative(primaryWindow, controlKey, wires[0]!);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual({ local, remote }, { local: 1, remote: 1 });
+    assert.equal(wires.length, 1);
+  });
+
+  it('deduplicates repeated native messages by both instance and event identity', () => {
+    const events = create('localStorage', 'native-repeated', true);
+    const seen: StorageEvent[] = [];
+    events.on('remove', event => { seen.push(event); });
+    const controlKey = 'nexusstorage:events:1:["localStorage","native-repeated"]';
+    const message = { instanceId: 'first-instance', eventId: 'same-event', type: 'remove', operation: 'remove', key: 'item', driver: 'localStorage', namespace: 'native-repeated', source: 'local' };
+    dispatchNative(primaryWindow, controlKey, JSON.stringify(message));
+    dispatchNative(primaryWindow, controlKey, JSON.stringify(message));
+    dispatchNative(primaryWindow, controlKey, JSON.stringify({ ...message, instanceId: 'second-instance' }));
+    assert.deepEqual(seen.map(event => event.key), ['item', 'item']);
+  });
+
+  it('bounds native replay history while accepting new events from a long-lived writer', () => {
+    const events = create('localStorage', 'native-history', true);
+    let changes = 0;
+    events.on('change', () => { changes++; });
+    const controlKey = 'nexusstorage:events:1:["localStorage","native-history"]';
+    const message = { instanceId: 'long-lived-instance', type: 'change', operation: 'set', key: 'item', driver: 'localStorage', namespace: 'native-history', source: 'local' };
+    const first = JSON.stringify({ ...message, eventId: 'event-0' });
+    dispatchNative(primaryWindow, controlKey, first);
+    for (let index = 1; index <= 1024; index++) {
+      dispatchNative(primaryWindow, controlKey, JSON.stringify({ ...message, eventId: `event-${index}` }));
+    }
+    assert.equal(changes, 1025);
+    dispatchNative(primaryWindow, controlKey, first);
+    assert.equal(changes, 1026);
+  });
+
+  it('preserves publication order for same-window and native peers during listener reentry', async () => {
+    const sender = create('localStorage', 'native-order', true);
+    const peer = create('localStorage', 'native-order', true);
+    const sameWindow: string[] = [];
+    sender.on('change', event => {
+      if (event.key === 'first') sender.publish({ type: 'change', operation: 'set', key: 'second' });
+    });
+    peer.on('change', event => { sameWindow.push(event.key!); });
+    useWindow(storageNetwork.createWindow());
+    const otherWindow = create('localStorage', 'native-order', true);
+    const native: string[] = [];
+    otherWindow.on('change', event => { native.push(event.key!); });
+    sender.publish({ type: 'change', operation: 'set', key: 'first' });
+    assert.deepEqual(sameWindow, ['first', 'second']);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(native, ['first', 'second']);
+  });
+
+  it('releases same-window registrations on cancellation and close, including reopened groups', () => {
+    const sender = create('localStorage', 'native-page-close', true);
+    const receiver = create('localStorage', 'native-page-close', true);
+    sender.prepare();
+    let changes = 0;
+    const first = receiver.on('change', () => { changes++; });
+    first();
+    sender.publish({ type: 'change', operation: 'set', key: 'cancelled' });
+    assert.equal(changes, 0);
+    receiver.on('change', () => { changes++; });
+    sender.publish({ type: 'change', operation: 'set', key: 'live' });
+    assert.equal(changes, 1);
+    receiver.close();
+    sender.publish({ type: 'change', operation: 'set', key: 'closed' });
+    assert.equal(changes, 1);
+    sender.close();
+    assert.equal(getEventListeners(primaryWindow, 'storage').length, 0);
+    const reopenedSender = create('localStorage', 'native-page-close', true);
+    const reopenedReceiver = create('localStorage', 'native-page-close', true);
+    reopenedSender.prepare();
+    reopenedReceiver.on('change', () => { changes++; });
+    reopenedSender.publish({ type: 'change', operation: 'set', key: 'reopened' });
+    assert.equal(changes, 2);
+    reopenedReceiver.close();
+    reopenedSender.close();
+    assert.equal(getEventListeners(primaryWindow, 'storage').length, 0);
   });
 
   it('strictly validates native control messages and rebuilds remote metadata', () => {
@@ -461,17 +632,14 @@ describe('storage events', () => {
     const seen: StorageEvent[] = [];
     events.on('clear', event => { seen.push(event); });
     const controlKey = 'nexusstorage:events:1:["localStorage","native-validation"]';
-    const valid = { id: 'unique-id', type: 'clear', operation: 'clear', driver: 'localStorage', namespace: 'native-validation', source: 'local' };
-    const dispatch = (key: string, newValue: string | null, storageArea: Storage = primaryWindow.localStorage) => {
-      const event = new Event('storage');
-      Object.defineProperties(event, { key: { value: key }, newValue: { value: newValue }, storageArea: { value: storageArea } });
-      primaryWindow.dispatchEvent(event);
-    };
+    const valid = { instanceId: 'writer-id', eventId: 'unique-id', type: 'clear', operation: 'clear', driver: 'localStorage', namespace: 'native-validation', source: 'local' };
+    const dispatch = (key: string, newValue: string | null, storageArea: Storage = primaryWindow.localStorage) => dispatchNative(primaryWindow, key, newValue, storageArea);
     dispatch(controlKey, null);
     dispatch(controlKey, 'not JSON');
     dispatch(controlKey, JSON.stringify(null));
     for (const patch of [
-      { id: '' }, { id: 1 }, { id: undefined }, { driver: 'indexedDB' }, { namespace: 'other' },
+      { instanceId: '' }, { instanceId: 1 }, { instanceId: undefined }, { eventId: '' }, { eventId: 1 }, { eventId: undefined },
+      { driver: 'indexedDB' }, { namespace: 'other' },
       { source: 'remote' }, { source: undefined }, { type: 'change' }, { key: 'forbidden' },
     ]) dispatch(controlKey, JSON.stringify({ ...valid, ...patch }));
     dispatch('nexusstorage:"native-validation":business-key', JSON.stringify(valid));
@@ -498,15 +666,20 @@ describe('storage events', () => {
 
   it('keeps committed local notifications successful when control writes or cleanup fail', () => {
     const events = create('localStorage', 'native-failures', true);
+    const peer = create('localStorage', 'native-failures', true);
     let changes = 0;
+    let remote = 0;
     events.on('change', () => { changes++; });
+    peer.on('change', () => { remote++; });
     storageNetwork.failSet = true;
     assert.doesNotThrow(() => events.publish({ type: 'change', operation: 'set', key: 'item' }));
     assert.equal(changes, 1);
+    assert.equal(remote, 1);
     storageNetwork.failSet = false;
     storageNetwork.failRemove = true;
     assert.doesNotThrow(() => events.publish({ type: 'change', operation: 'set', key: 'item' }));
     assert.equal(changes, 2);
+    assert.equal(remote, 2);
     storageNetwork.failRemove = false;
     events.publish({ type: 'change', operation: 'set', key: 'item' });
     assert.equal(storageNetwork.entries.size, 0);

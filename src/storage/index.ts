@@ -39,7 +39,12 @@ export class NexusStorage<S extends StorageSchemas = Record<never, never>> {
       throw new NexusStorageError('INVALID_OPTIONS', 'Expected a supported driver and a string namespace.');
     }
     this.capabilities = capabilitiesFor(driver);
-    this.codec = new RecordCodec(snapshotSchemas(options.schemas), this.capabilities.compareAndSwap);
+    const schemas = snapshotSchemas(options.schemas);
+    const storedSchemas = snapshotSchemas(options.storedSchemas);
+    for (const key of storedSchemas.keys()) {
+      if (!schemas.has(key)) throw new NexusStorageError('INVALID_OPTIONS', 'Stored schema keys must have a corresponding input schema.');
+    }
+    this.codec = new RecordCodec(schemas, this.capabilities.compareAndSwap, storedSchemas);
     this.events = new StorageEvents(driver, namespace, options.broadcast ?? false);
     switch (driver) {
       case 'memory':
@@ -204,6 +209,12 @@ export class NexusStorage<S extends StorageSchemas = Record<never, never>> {
   async keys(): Promise<string[]> {
     return this.enqueue(async () => {
       const live: string[] = [];
+      if (this.backend.scan) {
+        for (const { key, value } of await this.backend.scan()) {
+          if (!isExpired(decodeRecord(value), Date.now())) live.push(key);
+        }
+        return live.sort();
+      }
       for (const key of await this.backend.keys()) {
         const raw = await this.backend.get(key);
         if (raw !== undefined && !isExpired(decodeRecord(raw), Date.now())) live.push(key);

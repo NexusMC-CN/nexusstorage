@@ -1,4 +1,4 @@
-import type { StorageSchemas } from './schema.js';
+import type { StorageSchemas, StoredSchemas } from './schema.js';
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
@@ -14,6 +14,7 @@ export interface NexusStorageOptions<S extends StorageSchemas = Record<never, ne
   driver?: StorageDriver;
   namespace?: string;
   schemas?: S;
+  storedSchemas?: NoInfer<StoredSchemas<S>>;
   broadcast?: boolean;
 }
 

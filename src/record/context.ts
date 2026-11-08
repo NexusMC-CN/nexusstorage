@@ -3,7 +3,7 @@ import { NexusStorageError } from '../errors.js';
 import { decodeJson, encodeJson, mergeJson, snapshotJson } from '../json.js';
 import { createRevision, decodeRecord, encodeRecord, isExpired, resolveExpiresAt, revisionOf, snapshotWriteOptions } from './index.js';
 import type { WriteOptions } from './index.js';
-import { validateSchema } from '../schema.js';
+import { validateSchema, validateStoredSchema } from '../schema.js';
 import type { StandardSchemaV1 } from '../schema.js';
 import type { JsonObject } from '../types.js';
 import type { StorageEntry } from '../storage/api.js';
@@ -11,14 +11,22 @@ import type { StorageOperation } from '../events.js';
 
 /** Shared synchronous JSON/schema/TTL rules for normal calls and atomic workspaces. */
 export class RecordCodec {
-  constructor(private readonly schemas: ReadonlyMap<string, StandardSchemaV1>, private readonly versioned: boolean) {}
+  constructor(
+    private readonly schemas: ReadonlyMap<string, StandardSchemaV1>,
+    private readonly versioned: boolean,
+    private readonly storedSchemas: ReadonlyMap<string, StandardSchemaV1> = new Map(),
+  ) {}
+
+  private storedSchema(key: string): StandardSchemaV1 | undefined {
+    return this.storedSchemas.get(key) ?? this.schemas.get(key);
+  }
 
   entry(key: string, raw: string | undefined): StorageEntry | undefined {
     if (raw === undefined) return undefined;
     const record = decodeRecord(raw);
     if (isExpired(record, Date.now())) return undefined;
     const entry: StorageEntry = {
-      value: validateSchema(this.schemas.get(key), record.value),
+      value: validateStoredSchema(this.storedSchema(key), record.value),
       revision: revisionOf(raw, record),
     };
     if (record.expiresAt !== undefined) entry.expiresAt = record.expiresAt;
@@ -27,7 +35,8 @@ export class RecordCodec {
 
   set(key: string, value: unknown, options: WriteOptions | undefined, startedAt: number): string {
     const settings = snapshotWriteOptions(options);
-    const checked = validateSchema(this.schemas.get(key), value);
+    const converted = validateSchema(this.schemas.get(key), value);
+    const checked = validateStoredSchema(this.storedSchema(key), converted);
     return encodeRecord(checked, resolveExpiresAt(settings, startedAt), this.versioned ? createRevision() : undefined);
   }
 
@@ -40,7 +49,7 @@ export class RecordCodec {
     const record = raw === undefined ? undefined : decodeRecord(raw);
     if (!record || isExpired(record, Date.now())) throw new NexusStorageError('NOT_FOUND', 'The key does not exist or has expired.');
     const merged = decodeJson(mergeJson(encodeJson(record.value), snapshot as JsonObject));
-    const checked = validateSchema(this.schemas.get(key), merged);
+    const checked = validateStoredSchema(this.storedSchema(key), merged);
     const reset = settings.ttl !== undefined || settings.expiresAt !== undefined;
     const expiresAt = reset ? resolveExpiresAt(settings, startedAt) : record.expiresAt;
     return encodeRecord(checked, expiresAt, this.versioned ? createRevision() : undefined);

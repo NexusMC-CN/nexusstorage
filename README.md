@@ -125,6 +125,8 @@ Cache Storage 在安全上下文中可直接从页面或 Worker 使用，不强�
 
 Cache API 的原生 URL 匹配会忽略 `#` 片段。如果同一命名缓存中存在与内部记录 URL 冲突的非规范外部条目，相关读写以 `CORRUPT_DATA` 拒绝，避免误读、覆盖或删除外部数据。
 
+`keys()` 集中读取记录并过滤过期项，`clear()` 一次枚举后分析归属与冲突，避免逐 key 重复全库枚举；结果不长期缓存，因此后续调用仍能看到其他实例的新写入。单 key 操作可使用带请求条件的 Cache 查询，但不保证浏览器内部查询的复杂度。普通 JSON 响应使用 `application/json; charset=utf-8`；带 `NexusStorage/` 前缀的有效期或版本记录使用 `application/x.nexusstorage-record; charset=utf-8`，应通过本包解码。
+
 ## 配置与方法
 
 ```ts
@@ -137,6 +139,7 @@ const storage = new NexusStorage();
 | `driver` | `'memory' \| 'localStorage' \| 'sessionStorage' \| 'indexedDB' \| 'cacheStorage'` | `'localStorage'` |
 | `namespace` | `string` | `'nexusstorage'` |
 | `schemas` | 按 key 配置的 Standard Schema V1 对象 | 无业务校验 |
+| `storedSchemas` | 已声明 schema key 对应的存储值校验器，输入 / 输出绑定该 key 的 schema 输出类型 | 复用对应输入 schema 作存储校验 |
 | `broadcast` | `boolean`；仅 localStorage / IndexedDB / Cache Storage 支持 | `false` |
 
 五种后端的数据方法都返回 Promise，订阅方法 `on` 同步返回取消订阅函数。逻辑 key 必须是字符串。默认后端仍为 `localStorage`，原有普通 JSON 与 v1 有效期记录保持可读；驱动不支持的原子操作以 `UNSUPPORTED_OPERATION` 拒绝。
@@ -146,7 +149,7 @@ const storage = new NexusStorage();
 | `set(key, value, options?)` | 新建或完整替换 JSON 值，可设置有效期 | 写入值的独立快照；配置 schema 时为校验输出 |
 | `get<T>(key)` | 读取 JSON 值 | `T \| undefined`，缺失时为 `undefined` |
 | `getEntry<T>(key)` | 读取值、不透明版本与可选到期时间 | `StorageEntry<T> \| undefined` |
-| `update<T>(key, patch, options?)` | 浅合并已存在的普通对象，可重新设置有效期 | 合并后的完整对象；配置 schema 时为校验输出 |
+| `update<T>(key, patch, options?)` | 按存储形态浅合并已存在的普通对象，校验完整结果，可重新设置有效期 | 合并后对象的独立快照；校验不改变值 |
 | `has(key)` | 检查未过期的 key 是否存在 | `boolean` |
 | `remove(key)` | 删除 key，包括已过期的记录 | 删除前物理记录是否存在的 `boolean` |
 | `keys()` | 列出当前命名空间未过期的逻辑 key | 排序后的 `string[]` |
@@ -261,53 +264,71 @@ try {
 
 事件只包含 `type`、`operation`、可选 `key`、`driver`、`namespace` 和 `source: 'local' | 'remote'`，不携带业务值。成功提交的 `set / update / compareAndSwap` 发送 `change`；实际删除发送 `remove`；`clear` 成功后发送一个 `clear`。事务在全部提交后按每个 key 的最终修改合并通知；失败事务无通知。监听器抛错或异步拒绝不改变已经提交的结果，TTL 到期不会主动发送删除事件。
 
-默认仅通知当前实例。localStorage、IndexedDB 与 Cache Storage 可显式启用 `broadcast: true`，向同源、同驱动、同命名空间的订阅实例传播元数据；接收方重新读取存储。localStorage 使用浏览器的存储事件传递本包通知，IndexedDB 与 Cache Storage 使用 BroadcastChannel。Memory 与 sessionStorage 不支持跨独立标签页广播，传入 `broadcast: true` 会得到 `INVALID_OPTIONS`。通知所需的监听或通道在订阅或写入前惰性建立，相应平台 API 缺失时为 `STORAGE_UNAVAILABLE`。
+每次 `on` 调用建立独立订阅，即使传入同一回调也会分别调用；每个取消函数只取消对应订阅，可重复调用。关闭实例会释放其订阅与广播资源。
 
-localStorage 的跨上下文通知仅到达其他 window；浏览器不会把原生存储事件发送回写入所在的 window。写入实例仍收到自己的 `local` 事件，同一 window 内的其他实例不会因此收到 `remote` 事件；需要共享这类订阅时应复用实例。
+默认仅通知当前实例。localStorage、IndexedDB 与 Cache Storage 可显式启用 `broadcast: true`，向同源、同驱动、同命名空间的订阅实例传播元数据；接收方重新读取存储。localStorage 在同一页面内直接通知其他启用广播的实例，跨页面使用浏览器存储事件；通知携带内部标识用于去重，避免回声。IndexedDB 与 Cache Storage 使用 BroadcastChannel。Memory 与 sessionStorage 保持实例间通知隔离，不支持跨独立标签页广播，传入 `broadcast: true` 会得到 `INVALID_OPTIONS`。通知所需的监听或通道在订阅或写入前惰性建立，相应平台 API 缺失时为 `STORAGE_UNAVAILABLE`。
+
+写入实例收到自己的 `local` 事件；启用广播的其他实例收到 `remote` 事件，无论是否位于同一页面。`broadcast: false` 的实例只接收自己的通知，不参与页内或跨页广播。
 
 广播消息不持久化，也不提供锁或事务保证；外部直接调用浏览器原生存储 API 不会自动产生本包事件。
 
 ## 按 key 配置 Schema
 
-传入符合 Standard Schema V1 结构的校验器即可启用运行时校验，无需为本包安装额外运行时依赖。以下示例同时展示输入 / 输出推导和同步转换：
+传入符合 Standard Schema V1 结构的同步校验器即可启用运行时校验，无需额外运行时依赖。`schemas` 负责写入输入的转换，`storedSchemas` 负责检查转换后的存储形态。例如，字符串转长度后，读取只需检查数字：
 
 ```ts
 import { NexusStorage } from '@nexusmc-cn/nexusstorage';
 import type { StandardSchemaV1 } from '@nexusmc-cn/nexusstorage';
 
-const countSchema: StandardSchemaV1<string | number, number> = {
+const lengthSchema: StandardSchemaV1<string, number> = {
   '~standard': {
     version: 1,
     vendor: 'my-app',
     validate(value) {
-      const count = typeof value === 'string' || typeof value === 'number' ? Number(value) : NaN;
-      return Number.isFinite(count)
-        ? { value: count }
-        : { issues: [{ message: '需要有限数字或数字字符串' }] };
+      return typeof value === 'string'
+        ? { value: value.length }
+        : { issues: [{ message: '需要字符串输入' }] };
     },
   },
 };
 
-const counters = new NexusStorage({
+const storedNumber: StandardSchemaV1<number> = {
+  '~standard': {
+    version: 1,
+    vendor: 'my-app',
+    validate(value) {
+      return typeof value === 'number' && Number.isFinite(value)
+        ? { value }
+        : { issues: [{ message: '需要有限数字' }] };
+    },
+  },
+};
+
+const lengths = new NexusStorage({
   driver: 'memory',
-  schemas: { count: countSchema },
+  schemas: { length: lengthSchema },
+  storedSchemas: { length: storedNumber },
 });
 
 try {
-  const written = await counters.set('count', '42', { ttl: 60_000 }); // number
-  const read = await counters.get('count'); // number | undefined
-  // counters.set('count', false); // 类型错误：输入必须为 string | number
-  // counters.get('unknown');      // 类型错误：未声明的 key
+  const written = await lengths.set('length', 'hello', { ttl: 60_000 }); // number: 5
+  const read = await lengths.get('length'); // number | undefined: 5
+  // lengths.set('length', 5);    // 类型错误：输入必须为 string
+  // lengths.get('unknown');     // 类型错误：未声明的 key
 } finally {
-  await counters.close();
+  await lengths.close();
 }
 ```
 
-配置 `schemas` 的 TypeScript 实例将 key 限定为已声明项。`set` 与 CAS 接受对应 schema 的输入类型，读取、写入和事务方法按 key 返回输出类型；`getEntry` 与 CAS 用 `StorageEntry` 包装输出。`update` 的 patch 使用输出对象的 `Partial` 类型，并对浅合并后的完整对象执行校验。对象更新、TTL 与 Schema 组合示例见 [`examples/features/managed.ts`](examples/features/managed.ts)。公开类型还包括 `StorageSchemas`、`InferSchemaInput`、`InferSchemaOutput`、`WriteOptions`、`StorageCapabilities`、`StorageTransaction` 和 `StorageEvent`。
+配置 `schemas` 的 TypeScript 实例将 key 限定为已声明项。`set`、CAS 与 `tx.set` 接受对应输入类型，只执行一次输入转换；读取及写入结果按 key 推导输出类型，`getEntry` 与 CAS 用 `StorageEntry` 包装输出。`storedSchemas` 只允许已有 schema 的 key，校验器的输入 / 输出绑定该 key 的输出类型；它不会改变公开方法的类型推导。对象更新、TTL 与 Schema 组合示例见 [`examples/features/managed.ts`](examples/features/managed.ts)。公开类型还包括 `StorageSchemas`、`StoredSchemas`、`InferSchemaInput`、`InferSchemaOutput`、`WriteOptions`、`StorageCapabilities`、`StorageTransaction` 和 `StorageEvent`。
 
-输入在校验前捕获严格 JSON 快照，转换结果再次检查并复制，输入和输出均须符合下述 JSON 规则。`get` 会重新校验已存储的数据，包括历史数据；转换后的输出应能再次作为该 schema 的输入，并在重复校验时保持稳定。业务校验失败或校验器抛错返回 `VALIDATION_ERROR`，不符合 JSON 规则返回 `INVALID_VALUE`，失败不会覆盖旧值。
+输入在校验前捕获严格 JSON 快照，转换结果再次检查并复制，输入和输出均须符合下述 JSON 规则。写入前还会验证转换结果能作为存储值；`get`、`getEntry`、`tx.get` 同样验证已有数据，包括历史记录。存储校验必须保持 JSON 值不变，可以返回独立副本，比较时忽略对象属性顺序；改变值的转换会被拒绝，绝不采用二次转换结果。读取校验失败不重写记录。
 
-当前仅执行同步 schema 校验。返回 Promise 或 thenable 的校验器以 `ASYNC_SCHEMA` 拒绝；异步校验应在写入前由应用完成。配置只读取自身的 schema 项并在构造时复制；后续修改原 map 不改变实例配置。JavaScript 仍可读写未配置 schema 的 key，此类 key 只执行 JSON 校验。`keys()` 检查记录格式与有效期，不执行业务 schema 校验。
+`update` 与 `tx.update` 的 patch 使用输出对象的 `Partial` 类型。先按存储形态浅合并，再校验完整结果；配置独立 `storedSchemas` 后不会调用输入转换，因此计数加一、添加后缀等转换不会再次运行。patch 不执行 trim 等输入标准化，调用方应提供最终要存储的字段值。嵌套对象整体替换，详见下方浅合并示例。
+
+未为某个 key 配置 `storedSchemas` 时，复用对应输入 schema 进行存储校验，以兼容已有的幂等校验器。例如，trim 处理后的字符串可稳定回读；只接受字符串却输出数字、或每次执行 `number + 1` 的 schema 必须提供独立存储校验器，否则写入会在落盘前以 `VALIDATION_ERROR` 拒绝。业务校验失败、校验器抛错或存储校验改变值均返回 `VALIDATION_ERROR`，不符合 JSON 规则返回 `INVALID_VALUE`。失败写入保留旧值、有效期与版本，也不发送变更事件。
+
+当前仅执行同步 schema 校验。返回 Promise 或 thenable 的校验器以 `ASYNC_SCHEMA` 拒绝；异步校验应在写入前由应用完成。两种配置只读取自身的 schema 项并在构造时复制；后续修改原 map 不改变实例配置。JavaScript 仍可读写未配置 schema 的 key，此类 key 只执行 JSON 校验。`keys()` 检查记录格式与有效期，不执行业务 schema 校验。
 
 ## JSON 值规则
 
@@ -421,7 +442,7 @@ npm run build
 npm run test:consumer
 ```
 
-`npm run check` 依次执行类型检查、单元测试、构建与打包消费验证。消费检查对真实 tarball 进行离线安装，分别验证 ESM、CommonJS 和 NodeNext / Bundler 类型声明，覆盖五种后端、Memory 实例隔离、TTL / Schema、能力声明、版本读取、Memory / IndexedDB CAS 与事务提交 / 回滚，以及提交后事件；类型反例验证非法 JSON、Schema key / patch、异步事务回调与有效期互斥规则。浏览器 API 在该消费检查中使用测试替身，IndexedDB 使用 `fake-indexeddb`。`npm run test:consumer` 要求先完成构建。
+`npm run check` 依次执行类型检查、单元测试、构建与打包消费验证。消费检查对真实 tarball 进行离线安装，分别验证 ESM、CommonJS 和 NodeNext / Bundler 类型声明，覆盖五种后端、Memory 实例隔离、TTL、输入转换与独立存储校验、失败保留历史数据、能力声明、版本读取、Memory / IndexedDB CAS 与事务提交 / 回滚，以及提交后事件；类型反例验证非法 JSON、Schema key / patch、存储 schema key 与输出约束、异步事务回调与有效期互斥规则。浏览器 API 在该消费检查中使用测试替身，IndexedDB 使用 `fake-indexeddb`。`npm run test:consumer` 要求先完成构建。
 
 浏览器检查需要先安装 Playwright 对应的 Chromium：
 

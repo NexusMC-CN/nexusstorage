@@ -6,8 +6,14 @@ export class MemoryCache {
     return input instanceof Request ? input : new Request(input);
   }
 
-  #matchURL(request: Request): string {
+  #matchURL(request: Request, ignoreSearch = false): string {
     // Cache matching ignores URL fragments, while keys() retains the stored URL.
+    if (ignoreSearch) {
+      const url = new URL(request.url);
+      url.hash = '';
+      url.search = '';
+      return url.href;
+    }
     return request.url.split('#', 1)[0]!;
   }
 
@@ -28,8 +34,18 @@ export class MemoryCache {
     return request.method === 'GET' && this.#entries.delete(this.#matchURL(request));
   }
 
-  async keys(): Promise<Request[]> {
-    return [...this.#entries.values()].map(({ request }) => request.clone());
+  async keys(input?: RequestInfo | URL, options: CacheQueryOptions = {}): Promise<Request[]> {
+    const filter = input === undefined ? undefined : this.#request(input);
+    if (filter && filter.method !== 'GET' && !options.ignoreMethod) return [];
+    return [...this.#entries.values()]
+      .filter(({ request, response }) => {
+        if (!filter) return true;
+        if (this.#matchURL(request, options.ignoreSearch) !== this.#matchURL(filter, options.ignoreSearch)) return false;
+        const vary = response.headers.get('vary');
+        return options.ignoreVary || vary === null || vary.split(',').map(field => field.trim()).filter(Boolean)
+          .every(field => field !== '*' && request.headers.get(field) === filter.headers.get(field));
+      })
+      .map(({ request }) => request.clone());
   }
 }
 

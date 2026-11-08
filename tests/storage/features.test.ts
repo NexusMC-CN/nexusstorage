@@ -138,11 +138,11 @@ for (const driver of ['memory', 'localStorage', 'sessionStorage', 'indexedDB', '
       } });
       stores.push(store);
       await store.set('item', { n: 1 }, { ttl: 50 });
-      assert.equal(now, 10_100);
+      assert.equal(now, 10_200);
       assert.equal(await store.get('item'), undefined);
       assert.equal(await store.has('item'), false);
       assert.deepEqual(await store.keys(), []);
-      assert.equal(calls, 1);
+      assert.equal(calls, 2); // Input conversion, followed by validation of the stored output.
     });
 
     if (driver === 'cacheStorage') it('starts a replacement TTL before waiting for a backend read', async () => {
